@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node / frontend build
+node_modules/
+frontend/node_modules/
+frontend/dist/
+dist/
+
+# Local secrets and runtime state
+.env
+backend/.env
+backend/.env.prod
+*.session
+backend/sessions/
+
+# Local databases and logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Legacy local bot runner with machine-specific credentials
+copy_trader.py
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
