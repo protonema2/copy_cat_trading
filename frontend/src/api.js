@@ -1,10 +1,45 @@
 import axios from 'axios'
 
 const API_BASE = import.meta.env.VITE_API_BASE || '/api'
+const AUTH_TOKEN_KEY = 'copycat_dashboard_token'
+
+export const getAuthToken = () => localStorage.getItem(AUTH_TOKEN_KEY)
+
+export const setAuthToken = (token) => {
+  localStorage.setItem(AUTH_TOKEN_KEY, token)
+}
+
+export const clearAuthToken = () => {
+  localStorage.removeItem(AUTH_TOKEN_KEY)
+}
 
 export const apiClient = axios.create({
   baseURL: API_BASE,
 })
+
+apiClient.interceptors.request.use((config) => {
+  const token = getAuthToken()
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
+apiClient.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      clearAuthToken()
+    }
+    return Promise.reject(error)
+  }
+)
+
+// Dashboard auth
+export const authApi = {
+  login: (data) => apiClient.post('/auth/login', data),
+  me: () => apiClient.get('/auth/me'),
+}
 
 // Bot API calls
 export const botApi = {
@@ -24,7 +59,8 @@ export const channelApi = {
   create: (data) => apiClient.post('/channels', data),
   get: (id) => apiClient.get(`/channels/${id}`),
   getLogs: (id, limit = 100) => apiClient.get(`/channels/${id}/logs?limit=${limit}`),
-  postMessage: (id, message) => apiClient.post(`/channels/${id}/post-message`, { message }),
+  postMessage: (id, message, destinationIds = []) =>
+    apiClient.post(`/channels/${id}/post-message`, { message, destination_ids: destinationIds }),
   update: (id, data) => apiClient.put(`/channels/${id}`, data),
   delete: (id) => apiClient.delete(`/channels/${id}`),
 }
@@ -51,6 +87,7 @@ export const logApi = {
 // Telegram user session login
 export const telegramSessionApi = {
   status: () => apiClient.get('/telegram-session/status'),
+  readerStatus: () => apiClient.get('/telegram-reader/status'),
   start: (data) => apiClient.post('/telegram-session/start', data),
   verify: (code) => apiClient.post('/telegram-session/verify', { code }),
   password: (password) => apiClient.post('/telegram-session/password', { password }),

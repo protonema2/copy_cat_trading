@@ -4,15 +4,25 @@ import os
 import re
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, selectinload
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 from .database import SessionLocal
-from .message_rules import apply_copy_settings
-from .models import ActivityLog, Bot, Channel, TelegramUserSession
+from .message_rules import apply_copy_settings, render_output_template
+from .models import (
+    ActivityLog,
+    Bot,
+    Channel,
+    ChannelDestination,
+    ProcessedTelegramMessage,
+    TelegramUserSession,
+)
+from .security import decrypt_text
 
 
 ENTRY_KEYWORDS = [
@@ -23,163 +33,501 @@ ENTRY_KEYWORDS = [
     "XAUUSD SELL",
 ]
 
+
 class CopyTraderService:
-    def __init__(self, bot_id: int, channel_id: int):
+    def __init__(self, bot_id: int | None = None, channel_id: int | None = None):
         self.bot_id = bot_id
         self.channel_id = channel_id
         self.reader_client: Optional[TelegramClient] = None
-        self.last_signal: Optional[str] = None
         self.ready = asyncio.Event()
+        self.poll_task: Optional[asyncio.Task] = None
+        self.last_signals: dict[tuple[int, int], str] = {}
+        self.stop_requested = False
+        self.reconnect_attempts = 0
+        self.status = {
+            "state": "idle",
+            "is_running": False,
+            "is_authorized": False,
+            "last_error": None,
+            "last_connected_at": None,
+            "last_disconnected_at": None,
+            "reconnect_attempts": 0,
+            "updated_at": datetime.utcnow().isoformat(),
+        }
 
     async def start(self):
-        db = SessionLocal()
-        try:
-            bot = db.query(Bot).filter(Bot.id == self.bot_id).first()
-            channel = db.query(Channel).filter(Channel.id == self.channel_id).first()
-            if not bot or not channel:
-                return
+        self.stop_requested = False
 
-            if not bot.is_active:
-                print(f"Copy trader {self.bot_id}/{self.channel_id} did not start because bot is inactive.")
-                return
+        while not self.stop_requested:
+            db = SessionLocal()
+            try:
+                self.set_status("starting", is_running=False, is_authorized=False, last_error=None)
+                user_session = get_active_user_session(db)
+                if not user_session:
+                    message = "Telegram user session is not active. Complete Telegram login in the dashboard before starting listeners."
+                    log_system_error(db, message)
+                    self.set_status("waiting_for_session", is_running=False, is_authorized=False, last_error=message)
+                    return
 
-            user_session = get_active_user_session(db)
-            if not user_session:
-                self._log(
-                    db,
-                    "Telegram user session is not active. Complete Telegram login in the dashboard before starting listeners.",
-                    "error",
+                self.reader_client = build_user_reader_client(user_session)
+
+                @self.reader_client.on(events.NewMessage)
+                async def handler(event):
+                    await self.handle_telegram_message(event.message, source="live")
+
+                await self.reader_client.connect()
+                if not await self.reader_client.is_user_authorized():
+                    message = "Telegram user session is not authorized. Log in the user session before starting the backend."
+                    log_system_error(db, message)
+                    user_session.is_active = False
+                    user_session.updated_at = datetime.utcnow()
+                    db.commit()
+                    await self.reader_client.disconnect()
+                    self.ready.clear()
+                    self.set_status("invalid_session", is_running=False, is_authorized=False, last_error=message)
+                    return
+
+                self.ready.set()
+                self.reconnect_attempts = 0
+                self.set_status(
+                    "connected",
+                    is_running=True,
+                    is_authorized=True,
+                    last_error=None,
+                    last_connected_at=datetime.utcnow().isoformat(),
+                    reconnect_attempts=0,
                 )
-                return
-
-            self.reader_client = build_user_reader_client(user_session)
-
-            @self.reader_client.on(events.NewMessage(chats=channel.channel_handle))
-            async def handler(event):
-                await self._handle_message(event)
-
-            await self.reader_client.connect()
-            if not await self.reader_client.is_user_authorized():
-                self._log(
-                    db,
-                    "Telegram user session is not authorized. Log in the user session before starting the backend.",
+                self.poll_task = asyncio.create_task(self.poll_recent_messages())
+                print("Copy trader reader started. Listening to active linked channels.")
+            except Exception as exc:
+                db.rollback()
+                self.ready.clear()
+                self.reconnect_attempts += 1
+                self.set_status(
                     "error",
+                    is_running=False,
+                    is_authorized=False,
+                    last_error=str(exc),
+                    reconnect_attempts=self.reconnect_attempts,
                 )
-                await self.reader_client.disconnect()
-                return
+                log_system_error(db, f"Copy trader reader failed to start: {exc}")
+            finally:
+                db.close()
 
-            self.ready.set()
-            print(
-                f"Copy trader started. Listening to {channel.channel_handle}, forwarding to {channel.target_channel}.",
-            )
-        finally:
-            db.close()
+            if not self.reader_client or not self.reader_client.is_connected():
+                await self.reconnect_delay()
+                continue
 
-        await self.reader_client.run_until_disconnected()
+            try:
+                await self.reader_client.run_until_disconnected()
+                if not self.stop_requested:
+                    self.reconnect_attempts += 1
+                    self.set_status(
+                        "disconnected",
+                        is_running=False,
+                        is_authorized=False,
+                        last_error="Telegram reader disconnected",
+                        last_disconnected_at=datetime.utcnow().isoformat(),
+                        reconnect_attempts=self.reconnect_attempts,
+                    )
+            except Exception as exc:
+                self.reconnect_attempts += 1
+                self.set_status(
+                    "disconnected",
+                    is_running=False,
+                    is_authorized=False,
+                    last_error=str(exc),
+                    last_disconnected_at=datetime.utcnow().isoformat(),
+                    reconnect_attempts=self.reconnect_attempts,
+                )
+            finally:
+                self.ready.clear()
+                if self.poll_task:
+                    self.poll_task.cancel()
+                    self.poll_task = None
+                if self.reader_client:
+                    await self.reader_client.disconnect()
+                    self.reader_client = None
+
+            if not self.stop_requested:
+                await self.reconnect_delay()
 
     async def stop(self):
+        self.stop_requested = True
+        if self.poll_task:
+            self.poll_task.cancel()
         if self.reader_client:
             await self.reader_client.disconnect()
         self.ready.clear()
+        self.set_status(
+            "stopped",
+            is_running=False,
+            is_authorized=False,
+            last_disconnected_at=datetime.utcnow().isoformat(),
+        )
 
-    async def post_cms_message(self, message: str):
+    async def reconnect_delay(self):
+        delay = min(60, 5 * max(1, self.reconnect_attempts))
+        await asyncio.sleep(delay)
+
+    def set_status(self, state: str, **updates):
+        self.status.update(updates)
+        self.status["state"] = state
+        self.status["updated_at"] = datetime.utcnow().isoformat()
+        self.status["reconnect_attempts"] = self.reconnect_attempts if "reconnect_attempts" not in updates else updates["reconnect_attempts"]
+
+    def get_status(self) -> dict:
+        return dict(self.status)
+
+    async def post_cms_message(
+        self,
+        message: str,
+        bot_id: int | None = None,
+        channel_id: int | None = None,
+        destination_ids: list[int] | None = None,
+    ):
         await asyncio.wait_for(self.ready.wait(), timeout=15)
 
         db = SessionLocal()
         try:
-            channel = db.query(Channel).filter(Channel.id == self.channel_id).first()
-            if not channel:
-                raise ValueError("Channel not found")
+            target_bot_id = bot_id or self.bot_id
+            target_channel_id = channel_id or self.channel_id
+            channel = db.query(Channel).filter(Channel.id == target_channel_id).first()
+            if not channel or not target_bot_id:
+                raise ValueError("Channel or bot not found")
 
             text = message.strip()
             if not text:
                 raise ValueError("Message cannot be empty")
 
-            try:
-                await post_with_bot_token(self.bot_id, channel.target_channel, text)
-            except Exception as exc:
-                self._log(db, f"Failed to post CMS message to {channel.target_channel}: {exc}", "error")
-                raise
+            destinations = get_selected_destinations(channel, destination_ids)
+            if not destinations:
+                raise ValueError("Channel has no active destinations")
 
-            self._log(db, f"CMS message posted to {channel.target_channel}: {text}", "cms_post_sent")
+            for destination in destinations:
+                try:
+                    await post_with_bot_token(target_bot_id, destination.destination_handle, text)
+                except Exception as exc:
+                    self.log_activity(
+                        db,
+                        target_bot_id,
+                        target_channel_id,
+                        f"Failed to post CMS message to {destination.destination_handle}: {exc}",
+                        "error",
+                        destination_id=destination.id,
+                        destination_handle=destination.destination_handle,
+                    )
+                    continue
+
+                self.log_activity(
+                    db,
+                    target_bot_id,
+                    target_channel_id,
+                    f"CMS message posted to {destination.destination_handle}: {text}",
+                    "cms_post_sent",
+                    destination_id=destination.id,
+                    destination_handle=destination.destination_handle,
+                )
         finally:
             db.close()
 
-    async def _handle_message(self, event):
+    async def handle_telegram_message(self, message, source: str):
         db = SessionLocal()
         try:
-            bot = db.query(Bot).filter(Bot.id == self.bot_id).first()
-            channel = db.query(Channel).filter(Channel.id == self.channel_id).first()
-            if not bot or not channel:
+            active_pairs = get_active_channel_pairs(db)
+            if not active_pairs:
                 return
 
-            msg = event.message.text or event.message.message or ""
-            if not msg:
-                msg = getattr(event.message, "caption", "") or ""
+            matched_pairs = []
+            for bot, channel in active_pairs:
+                if await message_matches_channel(self.reader_client, message, channel):
+                    matched_pairs.append((bot, channel))
 
-            text = msg.strip()
-            if not text:
-                self._log(db, f"Non-text activity received from {channel.channel_handle}", "channel_activity")
-                return
-
-            cleaned = clean_message(text)
-            self._log(db, f"Message received from {channel.channel_handle}: {cleaned}", "channel_activity")
-
-            if not channel.forward_message:
-                self._log(db, f"Forward message is disabled for {channel.channel_handle}", "message_ignored")
-                return
-
-            if not channel.target_channel:
-                self._log(db, f"Target channel is empty for {channel.channel_handle}", "error")
-                return
-
-            configured_output = apply_copy_settings(channel.copy_settings, text)
-            if channel.copy_settings:
-                if not configured_output:
-                    self._log(db, f"Message did not match any filtered message for {channel.channel_handle}", "message_filtered")
-                    return
-
-                try:
-                    await post_with_bot_token(bot.id, channel.target_channel, configured_output.output_message)
-                except Exception as exc:
-                    self._log(db, f"Failed to post configured output to {channel.target_channel}: {exc}", "error")
-                    return
-
-                self._log(db, f"Configured output posted to {channel.target_channel}: {configured_output.output_message}", "template_sent")
-                return
-
-            signal = find_entry_keyword(text)
-            if not signal:
-                if not should_forward_all_messages():
-                    self._log(db, f"Ignored message without entry keyword from {channel.channel_handle}", "signal_ignored")
-                    return
-
-                self._log(db, f"Forwarding non-signal message to {channel.target_channel}", "message_received")
-            else:
-                if signal == self.last_signal:
-                    self._log(db, f"Ignored duplicate signal: {signal}", "signal_duplicate")
-                    return
-
-                self._log(db, f"Signal matched ({signal}); forwarding to {channel.target_channel}", "signal_received")
-
-            try:
-                await post_with_bot_token(bot.id, channel.target_channel, cleaned)
-            except Exception as exc:
-                self._log(db, f"Failed to post copied message to {channel.target_channel}: {exc}", "error")
-                return
-
-            if signal:
-                self.last_signal = signal
-                self._log(db, f"Signal forwarded to {channel.target_channel}: {cleaned}", "signal_sent")
-            else:
-                self._log(db, f"Message forwarded to {channel.target_channel}: {cleaned}", "message_sent")
+            for bot, channel in matched_pairs:
+                await self.process_message_for_pair(db, bot, channel, message, source)
         finally:
             db.close()
 
-    def _log(self, db: Session, message: str, log_type: str):
+    async def poll_recent_messages(self):
+        interval = int(os.getenv("COPY_TRADER_POLL_INTERVAL_SECONDS", "15"))
+        limit = int(os.getenv("COPY_TRADER_POLL_LIMIT", "5"))
+
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self.ready.wait()
+
+                db = SessionLocal()
+                try:
+                    unique_channels = {
+                        channel.id: channel
+                        for _bot, channel in get_active_channel_pairs(db)
+                    }
+                finally:
+                    db.close()
+
+                for channel in unique_channels.values():
+                    try:
+                        async for message in self.reader_client.iter_messages(
+                            channel.channel_handle,
+                            limit=limit,
+                        ):
+                            await self.handle_telegram_message(message, source="poll")
+                    except Exception as exc:
+                        db = SessionLocal()
+                        try:
+                            log_system_error(
+                                db,
+                                f"Polling failed for {channel.channel_handle}: {exc}",
+                                channel_id=channel.id,
+                            )
+                        finally:
+                            db.close()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                db = SessionLocal()
+                try:
+                    log_system_error(db, f"Copy trader polling loop failed: {exc}")
+                finally:
+                    db.close()
+
+    async def process_message_for_pair(self, db: Session, bot: Bot, channel: Channel, message, source: str):
+        telegram_message_id = getattr(message, "id", None)
+        telegram_message_date = normalize_datetime(getattr(message, "date", None))
+        delay_seconds = calculate_delay_seconds(telegram_message_date)
+
+        if telegram_message_id and not mark_message_processed(
+            db,
+            bot.id,
+            channel.id,
+            telegram_message_id,
+            telegram_message_date,
+        ):
+            return
+
+        msg = message.text or message.message or ""
+        if not msg:
+            msg = getattr(message, "caption", "") or ""
+
+        text = msg.strip()
+        if not text:
+            self.log_activity(
+                db,
+                bot.id,
+                channel.id,
+                f"Non-text activity received from {channel.channel_handle}",
+                "channel_activity",
+                telegram_message_id,
+                telegram_message_date,
+                delay_seconds,
+            )
+            return
+
+        cleaned = clean_message(text)
+        self.log_activity(
+            db,
+            bot.id,
+            channel.id,
+            f"Message received from {channel.channel_handle} via {source}; delay={delay_seconds}s: {cleaned}",
+            "channel_activity",
+            telegram_message_id,
+            telegram_message_date,
+            delay_seconds,
+        )
+
+        if not channel.forward_message:
+            self.log_activity(
+                db,
+                bot.id,
+                channel.id,
+                f"Forward message is disabled for {channel.channel_handle}",
+                "message_ignored",
+                telegram_message_id,
+                telegram_message_date,
+                delay_seconds,
+            )
+            return
+
+        destinations = get_active_destinations(channel)
+        if not destinations:
+            self.log_activity(
+                db,
+                bot.id,
+                channel.id,
+                f"No active destination channels configured for {channel.channel_handle}",
+                "error",
+                telegram_message_id,
+                telegram_message_date,
+                delay_seconds,
+            )
+            return
+
+        configured_output = apply_copy_settings(channel.copy_settings, text)
+        if channel.copy_settings:
+            if not configured_output:
+                self.log_activity(
+                    db,
+                    bot.id,
+                    channel.id,
+                    f"Message did not match any filtered message for {channel.channel_handle}",
+                    "message_filtered",
+                    telegram_message_id,
+                    telegram_message_date,
+                    delay_seconds,
+                )
+                return
+
+            try:
+                await self.post_to_destinations(
+                    db,
+                    bot,
+                    channel,
+                    destinations,
+                    configured_output.output_message,
+                    configured_output.variables or {},
+                    "template_sent",
+                    telegram_message_id,
+                    telegram_message_date,
+                    delay_seconds,
+                )
+            except Exception:
+                pass
+            return
+
+        signal = find_entry_keyword(text)
+        if not signal:
+            if not should_forward_all_messages():
+                self.log_activity(
+                    db,
+                    bot.id,
+                    channel.id,
+                    f"Ignored message without entry keyword from {channel.channel_handle}",
+                    "signal_ignored",
+                    telegram_message_id,
+                    telegram_message_date,
+                    delay_seconds,
+                )
+                return
+
+            self.log_activity(
+                db,
+                bot.id,
+                channel.id,
+                f"Forwarding non-signal message to {len(destinations)} destination(s)",
+                "message_received",
+                telegram_message_id,
+                telegram_message_date,
+                delay_seconds,
+            )
+        else:
+            signal_key = (bot.id, channel.id)
+            if signal == self.last_signals.get(signal_key):
+                self.log_activity(
+                    db,
+                    bot.id,
+                    channel.id,
+                    f"Ignored duplicate signal: {signal}",
+                    "signal_duplicate",
+                    telegram_message_id,
+                    telegram_message_date,
+                    delay_seconds,
+                )
+                return
+
+            self.log_activity(
+                db,
+                bot.id,
+                channel.id,
+                f"Signal matched ({signal}); forwarding to {len(destinations)} destination(s)",
+                "signal_received",
+                telegram_message_id,
+                telegram_message_date,
+                delay_seconds,
+            )
+
+        await self.post_to_destinations(
+            db,
+            bot,
+            channel,
+            destinations,
+            cleaned,
+            {"original_message": text},
+            "signal_sent" if signal else "message_sent",
+            telegram_message_id,
+            telegram_message_date,
+            delay_seconds,
+        )
+
+        if signal:
+            self.last_signals[(bot.id, channel.id)] = signal
+
+    async def post_to_destinations(
+        self,
+        db: Session,
+        bot: Bot,
+        channel: Channel,
+        destinations: list[ChannelDestination],
+        default_message: str,
+        variables: dict[str, str],
+        success_log_type: str,
+        telegram_message_id: int | None,
+        telegram_message_date: datetime | None,
+        delay_seconds: int | None,
+    ):
+        for destination in destinations:
+            output_message = resolve_destination_output(destination, default_message, variables)
+            try:
+                await post_with_bot_token(bot.id, destination.destination_handle, output_message)
+            except Exception as exc:
+                self.log_activity(
+                    db,
+                    bot.id,
+                    channel.id,
+                    f"Failed to post to {destination.destination_handle}: {exc}",
+                    "error",
+                    telegram_message_id,
+                    telegram_message_date,
+                    delay_seconds,
+                    destination_id=destination.id,
+                    destination_handle=destination.destination_handle,
+                )
+                continue
+
+            self.log_activity(
+                db,
+                bot.id,
+                channel.id,
+                f"Posted to {destination.destination_handle}: {output_message}",
+                success_log_type,
+                telegram_message_id,
+                telegram_message_date,
+                delay_seconds,
+                destination_id=destination.id,
+                destination_handle=destination.destination_handle,
+            )
+
+    def log_activity(
+        self,
+        db: Session,
+        bot_id: int,
+        channel_id: int | None,
+        message: str,
+        log_type: str,
+        telegram_message_id: int | None = None,
+        telegram_message_date: datetime | None = None,
+        delay_seconds: int | None = None,
+        destination_id: int | None = None,
+        destination_handle: str | None = None,
+    ):
         log = ActivityLog(
-            bot_id=self.bot_id,
-            channel_id=self.channel_id,
+            bot_id=bot_id,
+            channel_id=channel_id,
+            destination_id=destination_id,
+            destination_handle=destination_handle,
+            telegram_message_id=telegram_message_id,
+            telegram_message_date=telegram_message_date,
+            delay_seconds=delay_seconds,
             message=message,
             log_type=log_type,
         )
@@ -211,12 +559,163 @@ def get_active_user_session(db: Session) -> Optional[TelegramUserSession]:
     ).order_by(TelegramUserSession.updated_at.desc()).first()
 
 
+def get_active_channel_pairs(db: Session) -> list[tuple[Bot, Channel]]:
+    bots = db.query(Bot).options(
+        selectinload(Bot.channels).selectinload(Channel.copy_settings),
+        selectinload(Bot.channels).selectinload(Channel.destinations),
+    ).filter(Bot.is_active == True).all()
+
+    return [
+        (bot, channel)
+        for bot in bots
+        for channel in bot.channels
+    ]
+
+
+def get_active_destinations(channel: Channel) -> list[ChannelDestination]:
+    destinations = [
+        destination
+        for destination in channel.destinations
+        if destination.is_active and destination.destination_handle
+    ]
+    if destinations:
+        return destinations
+
+    if channel.target_channel:
+        return [
+            ChannelDestination(
+                id=None,
+                channel_id=channel.id,
+                destination_name=channel.target_channel,
+                destination_handle=channel.target_channel,
+                is_active=True,
+                use_rule_output=True,
+            )
+        ]
+
+    return []
+
+
+def get_selected_destinations(channel: Channel, destination_ids: list[int] | None) -> list[ChannelDestination]:
+    active_destinations = get_active_destinations(channel)
+    if not destination_ids:
+        return active_destinations
+
+    selected_ids = {int(destination_id) for destination_id in destination_ids}
+    return [
+        destination
+        for destination in active_destinations
+        if destination.id in selected_ids
+    ]
+
+
+def resolve_destination_output(
+    destination: ChannelDestination,
+    default_message: str,
+    variables: dict[str, str],
+) -> str:
+    if destination.use_rule_output or not destination.custom_output_message:
+        return default_message
+
+    return render_output_template(destination.custom_output_message, default_message, variables)
+
+
 def build_user_reader_client(user_session: TelegramUserSession) -> TelegramClient:
     return TelegramClient(
-        StringSession(user_session.session_string),
+        StringSession(decrypt_text(user_session.session_string) or ""),
         int(user_session.api_id),
         user_session.api_hash,
     )
+
+
+async def message_matches_channel(client: TelegramClient, message, channel: Channel) -> bool:
+    try:
+        chat = await message.get_chat()
+    except Exception:
+        chat = None
+
+    handle = (channel.channel_handle or "").strip().lower()
+    if not handle:
+        return False
+
+    candidates = set()
+
+    if chat is not None:
+        username = getattr(chat, "username", None)
+        if username:
+            candidates.add(username.lower())
+            candidates.add(f"@{username.lower()}")
+
+        chat_id = getattr(chat, "id", None)
+        if chat_id is not None:
+            candidates.add(str(chat_id))
+            candidates.add(str(get_peer_id(chat_id)))
+
+    return handle in candidates or handle.lstrip("@") in candidates
+
+
+def get_peer_id(chat_id: int) -> int:
+    return int(f"-100{chat_id}") if chat_id > 0 else chat_id
+
+
+def mark_message_processed(
+    db: Session,
+    bot_id: int,
+    channel_id: int,
+    telegram_message_id: int,
+    telegram_message_date: datetime | None,
+) -> bool:
+    processed = ProcessedTelegramMessage(
+        bot_id=bot_id,
+        channel_id=channel_id,
+        telegram_message_id=telegram_message_id,
+        telegram_message_date=telegram_message_date,
+    )
+    db.add(processed)
+
+    try:
+        db.commit()
+        return True
+    except IntegrityError:
+        db.rollback()
+        return False
+
+
+def normalize_datetime(value) -> datetime | None:
+    if not value:
+        return None
+
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    return value
+
+
+def calculate_delay_seconds(telegram_message_date: datetime | None) -> int | None:
+    if not telegram_message_date:
+        return None
+
+    return max(0, int((datetime.utcnow() - telegram_message_date).total_seconds()))
+
+
+def log_system_error(
+    db: Session,
+    message: str,
+    channel_id: int | None = None,
+):
+    bot = db.query(Bot).filter(Bot.is_active == True).first()
+    if not bot:
+        print(message)
+        return
+
+    log = ActivityLog(
+        bot_id=bot.id,
+        channel_id=channel_id,
+        message=message,
+        log_type="error",
+    )
+    db.add(log)
+    db.commit()
 
 
 async def post_with_bot_token(bot_id: int, target_channel: str, message: str) -> None:
@@ -301,7 +800,7 @@ def register_configured_copy_trader(db: Session) -> tuple[Optional[int], Optiona
     return bot.id, channel.id
 
 
-def start_copy_trader_background(bot_id: int, channel_id: int):
+def start_copy_trader_background(bot_id: int | None = None, channel_id: int | None = None):
     service = CopyTraderService(bot_id=bot_id, channel_id=channel_id)
     task = asyncio.create_task(service.start())
     return service, task

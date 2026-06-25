@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, ForeignKey, Table
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, ForeignKey, Table, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from datetime import datetime
@@ -52,11 +52,32 @@ class Channel(Base):
         back_populates="channels"
     )
     logs = relationship("ActivityLog", back_populates="channel")
+    destinations = relationship(
+        "ChannelDestination",
+        back_populates="channel",
+        cascade="all, delete-orphan",
+    )
     copy_settings = relationship(
         "TradingCopySetting",
         back_populates="channel",
         cascade="all, delete-orphan",
     )
+
+
+class ChannelDestination(Base):
+    __tablename__ = "channel_destinations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    channel_id = Column(Integer, ForeignKey("channels.id", ondelete="CASCADE"), index=True)
+    destination_name = Column(String)
+    destination_handle = Column(String)
+    is_active = Column(Boolean, default=True)
+    use_rule_output = Column(Boolean, default=True)
+    custom_output_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    channel = relationship("Channel", back_populates="destinations")
 
 
 class TradingCopySetting(Base):
@@ -81,6 +102,11 @@ class ActivityLog(Base):
     id = Column(Integer, primary_key=True, index=True)
     bot_id = Column(Integer, ForeignKey("bots.id"), index=True)
     channel_id = Column(Integer, ForeignKey("channels.id"), nullable=True, index=True)
+    destination_id = Column(Integer, ForeignKey("channel_destinations.id"), nullable=True, index=True)
+    destination_handle = Column(String, nullable=True)
+    telegram_message_id = Column(Integer, nullable=True, index=True)
+    telegram_message_date = Column(DateTime, nullable=True)
+    delay_seconds = Column(Integer, nullable=True)
     message = Column(Text)
     log_type = Column(String)  # "signal_received", "signal_sent", "error", "info"
     created_at = Column(DateTime, server_default=func.now(), index=True)
@@ -105,3 +131,22 @@ class TelegramUserSession(Base):
     username = Column(String, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class ProcessedTelegramMessage(Base):
+    __tablename__ = "processed_telegram_messages"
+    __table_args__ = (
+        UniqueConstraint(
+            "bot_id",
+            "channel_id",
+            "telegram_message_id",
+            name="uq_processed_telegram_message",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    bot_id = Column(Integer, ForeignKey("bots.id"), index=True)
+    channel_id = Column(Integer, ForeignKey("channels.id"), index=True)
+    telegram_message_id = Column(Integer, index=True)
+    telegram_message_date = Column(DateTime, nullable=True)
+    processed_at = Column(DateTime, server_default=func.now(), index=True)

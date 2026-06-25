@@ -1,56 +1,92 @@
 import React from 'react'
 import { Link, useLocation } from 'react-router-dom'
-import { Bot, Radio, UserCog } from 'lucide-react'
+import { Bot, LogOut, PanelLeftClose, PanelLeftOpen, Radio, UserCog } from 'lucide-react'
 
-export default function Sidebar() {
+export default function Sidebar({ user, collapsed, onToggleCollapse, onLogout }) {
   const location = useLocation()
 
   const isActive = (path) => location.pathname === path
+  const navLinkClass = (path) =>
+    `flex shrink-0 items-center gap-2 rounded-lg px-3 py-2 text-sm transition-colors sm:gap-3 sm:px-4 ${
+      isActive(path)
+        ? 'bg-blue-600 text-white'
+        : 'text-gray-300 hover:bg-gray-700 hover:text-white'
+    }`
 
   return (
-    <aside className="w-64 bg-gray-800 border-r border-gray-700 p-6">
-      <div className="mb-8">
-        <h1 className="text-2xl font-bold text-white">CopyCat</h1>
-        <p className="text-sm text-gray-400">Trading Bot Manager</p>
+    <aside
+      className={`border-b border-gray-700 bg-gray-800/95 p-4 transition-[width] duration-200 lg:flex lg:flex-col lg:border-b-0 lg:border-r lg:p-4 ${
+        collapsed ? 'lg:w-20' : 'lg:w-64'
+      }`}
+    >
+      <div className="mb-4 flex items-center justify-between gap-4 lg:mb-8 lg:block">
+        <div className={`min-w-0 ${collapsed ? 'lg:hidden' : ''}`}>
+          <h1 className="truncate text-xl font-bold text-white lg:text-2xl">CopyCat</h1>
+          <p className="truncate text-xs text-gray-400 sm:text-sm">Trading Bot Manager</p>
+        </div>
+        <button
+          type="button"
+          onClick={onToggleCollapse}
+          className="hidden rounded-lg p-2 text-gray-300 transition-colors hover:bg-gray-700 hover:text-white lg:flex"
+          title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+        >
+          {collapsed ? <PanelLeftOpen size={20} /> : <PanelLeftClose size={20} />}
+        </button>
+        <button
+          type="button"
+          onClick={onLogout}
+          className="flex shrink-0 items-center gap-2 rounded-lg px-3 py-2 text-sm text-gray-300 transition-colors hover:bg-gray-700 hover:text-white lg:hidden"
+        >
+          <LogOut size={18} />
+          <span>Logout</span>
+        </button>
       </div>
 
-      <nav className="space-y-4">
+      <nav className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-1 lg:mx-0 lg:flex-1 lg:flex-col lg:space-y-2 lg:overflow-visible lg:px-0 lg:pb-0">
         <Link
           to="/bots"
-          className={`flex items-center gap-3 px-4 py-2 rounded-lg transition-colors ${
-            isActive('/bots')
-              ? 'bg-blue-600 text-white'
-              : 'text-gray-300 hover:bg-gray-700'
-          }`}
+          className={`${navLinkClass('/bots')} ${collapsed ? 'lg:justify-center lg:px-3' : ''}`}
+          title="Bots"
         >
-          <Bot size={20} />
-          <span>Bots</span>
+          <Bot size={19} />
+          <span className={collapsed ? 'lg:hidden' : ''}>Bots</span>
         </Link>
 
         <Link
           to="/channels"
-          className={`flex items-center gap-3 px-4 py-2 rounded-lg transition-colors ${
-            isActive('/channels')
-              ? 'bg-blue-600 text-white'
-              : 'text-gray-300 hover:bg-gray-700'
-          }`}
+          className={`${navLinkClass('/channels')} ${collapsed ? 'lg:justify-center lg:px-3' : ''}`}
+          title="Channels"
         >
-          <Radio size={20} />
-          <span>Channels</span>
+          <Radio size={19} />
+          <span className={collapsed ? 'lg:hidden' : ''}>Channels</span>
         </Link>
 
         <Link
           to="/telegram-session"
-          className={`flex items-center gap-3 px-4 py-2 rounded-lg transition-colors ${
-            isActive('/telegram-session')
-              ? 'bg-blue-600 text-white'
-              : 'text-gray-300 hover:bg-gray-700'
-          }`}
+          className={`${navLinkClass('/telegram-session')} ${collapsed ? 'lg:justify-center lg:px-3' : ''}`}
+          title="Telegram"
         >
-          <UserCog size={20} />
-          <span>Telegram</span>
+          <UserCog size={19} />
+          <span className={collapsed ? 'lg:hidden' : ''}>Telegram</span>
         </Link>
       </nav>
+
+      <div className="hidden border-t border-gray-700 pt-4 lg:block">
+        <p className={`mb-3 truncate text-sm text-gray-400 ${collapsed ? 'lg:hidden' : ''}`}>
+          {user?.username || 'Dashboard user'}
+        </p>
+        <button
+          type="button"
+          onClick={onLogout}
+          className={`flex w-full items-center gap-3 rounded-lg px-4 py-2 text-gray-300 transition-colors hover:bg-gray-700 ${
+            collapsed ? 'lg:justify-center lg:px-3' : ''
+          }`}
+          title="Logout"
+        >
+          <LogOut size={20} />
+          <span className={collapsed ? 'lg:hidden' : ''}>Logout</span>
+        </button>
+      </div>
     </aside>
   )
 }

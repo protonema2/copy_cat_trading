@@ -1,5 +1,6 @@
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, Query
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 from telethon import TelegramClient
@@ -7,21 +8,29 @@ from telethon.errors import SessionPasswordNeededError
 from telethon.sessions import StringSession
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+import base64
 import csv
+import hashlib
+import hmac
 import io
+import json
 import os
+import secrets
+import time
 
 from .copy_trader_service import register_configured_copy_trader, start_copy_trader_background
 from .database import engine, get_db, Base, SessionLocal
 from .message_rules import apply_copy_setting
-from .models import Bot, Channel, ActivityLog, TelegramUserSession, TradingCopySetting, bot_channel_association
+from .models import Bot, Channel, ChannelDestination, ActivityLog, TelegramUserSession, TradingCopySetting, bot_channel_association
+from .security import decrypt_text, encrypt_text, is_encrypted
 from .schemas import (
+    DashboardLogin, DashboardToken, DashboardUser,
     BotCreate, BotUpdate, BotResponse, BotDetailResponse,
     ChannelCreate, ChannelUpdate, ChannelResponse, ChannelDetailResponse,
     ActivityLogResponse, ActivityLogCreate, ChannelPostCreate,
     RulePreviewRequest, RulePreviewResponse,
     TelegramSessionStatus, TelegramLoginStart, TelegramLoginVerify, TelegramLoginPassword,
-    BotChannelLink
+    TelegramReaderStatus, BotChannelLink
 )
 
 def create_tables() -> None:
@@ -43,6 +52,16 @@ def ensure_runtime_columns() -> None:
         log_columns = {column["name"] for column in inspector.get_columns("activity_logs")}
         if "channel_id" not in log_columns:
             conn.execute(text("ALTER TABLE activity_logs ADD COLUMN channel_id INTEGER"))
+        if "destination_id" not in log_columns:
+            conn.execute(text("ALTER TABLE activity_logs ADD COLUMN destination_id INTEGER"))
+        if "destination_handle" not in log_columns:
+            conn.execute(text("ALTER TABLE activity_logs ADD COLUMN destination_handle VARCHAR"))
+        if "telegram_message_id" not in log_columns:
+            conn.execute(text("ALTER TABLE activity_logs ADD COLUMN telegram_message_id INTEGER"))
+        if "telegram_message_date" not in log_columns:
+            conn.execute(text("ALTER TABLE activity_logs ADD COLUMN telegram_message_date TIMESTAMP"))
+        if "delay_seconds" not in log_columns:
+            conn.execute(text("ALTER TABLE activity_logs ADD COLUMN delay_seconds INTEGER"))
 
         channel_columns = {column["name"] for column in inspector.get_columns("channels")}
         if "forward_message" not in channel_columns:
@@ -61,7 +80,169 @@ def ensure_runtime_columns() -> None:
             conn.execute(text("UPDATE trading_copy_settings SET match_type = 'contains' WHERE match_type IS NULL"))
             conn.execute(text("UPDATE trading_copy_settings SET priority = 0 WHERE priority IS NULL"))
 
+
+def encrypt_existing_telegram_sessions() -> None:
+    db = SessionLocal()
+    try:
+        sessions = db.query(TelegramUserSession).filter(
+            TelegramUserSession.session_string.isnot(None)
+        ).all()
+        changed = False
+        for session in sessions:
+            if session.session_string and not is_encrypted(session.session_string):
+                session.session_string = encrypt_text(session.session_string)
+                session.updated_at = datetime.utcnow()
+                changed = True
+
+        if changed:
+            db.commit()
+    finally:
+        db.close()
+
+
+def migrate_existing_channel_destinations() -> None:
+    db = SessionLocal()
+    try:
+        channels = db.query(Channel).all()
+        changed = False
+        for channel in channels:
+            if channel.destinations or not channel.target_channel:
+                continue
+
+            channel.destinations = [
+                ChannelDestination(
+                    destination_name=channel.target_channel.lstrip("@") or "Default Destination",
+                    destination_handle=channel.target_channel,
+                    is_active=True,
+                    use_rule_output=True,
+                )
+            ]
+            changed = True
+
+        if changed:
+            db.commit()
+    finally:
+        db.close()
+
 app = FastAPI(title="Copy Trading Dashboard API")
+
+DASHBOARD_ADMIN_USERNAME = os.getenv("DASHBOARD_ADMIN_USERNAME", "admin")
+DASHBOARD_ADMIN_PASSWORD = os.getenv("DASHBOARD_ADMIN_PASSWORD", "changeme")
+DASHBOARD_AUTH_SECRET = os.getenv("DASHBOARD_AUTH_SECRET", "change-me-before-production")
+DASHBOARD_TOKEN_EXPIRE_SECONDS = int(os.getenv("DASHBOARD_TOKEN_EXPIRE_SECONDS", "43200"))
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ORIGINS",
+        "http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:8000,http://localhost:8000",
+    ).split(",")
+    if origin.strip()
+]
+AUTH_PUBLIC_PATHS = {"/api/auth/login", "/health"}
+AUTH_PUBLIC_PREFIXES = ("/docs", "/openapi.json", "/redoc")
+
+if (
+    DASHBOARD_ADMIN_PASSWORD == "changeme"
+    or DASHBOARD_AUTH_SECRET == "change-me-before-production"
+):
+    print("WARNING: Dashboard auth is using default credentials/secret. Change them before production.")
+
+
+def base64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def base64url_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+
+def create_access_token(username: str) -> str:
+    payload = {
+        "sub": username,
+        "exp": int(time.time()) + DASHBOARD_TOKEN_EXPIRE_SECONDS,
+    }
+    payload_data = base64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    signature = hmac.new(
+        DASHBOARD_AUTH_SECRET.encode("utf-8"),
+        payload_data.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    return f"{payload_data}.{base64url_encode(signature)}"
+
+
+def verify_access_token(token: str) -> str | None:
+    try:
+        payload_data, provided_signature = token.split(".", 1)
+        expected_signature = hmac.new(
+            DASHBOARD_AUTH_SECRET.encode("utf-8"),
+            payload_data.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(base64url_decode(provided_signature), expected_signature):
+            return None
+
+        payload = json.loads(base64url_decode(payload_data))
+        if int(payload.get("exp", 0)) < int(time.time()):
+            return None
+        return payload.get("sub")
+    except Exception:
+        return None
+
+
+def authenticated_username(request: Request) -> str:
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    username = verify_access_token(token)
+    if not username:
+        raise HTTPException(status_code=401, detail="Invalid or expired authentication token")
+    return username
+
+
+@app.middleware("http")
+async def require_dashboard_auth(request: Request, call_next):
+    path = request.url.path
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    if path in AUTH_PUBLIC_PATHS or any(path.startswith(prefix) for prefix in AUTH_PUBLIC_PREFIXES):
+        return await call_next(request)
+    if not path.startswith("/api"):
+        return await call_next(request)
+
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    username = verify_access_token(token) if scheme.lower() == "bearer" and token else None
+    if not username:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Authentication required"},
+        )
+
+    request.state.dashboard_user = username
+    return await call_next(request)
+
+
+@app.post("/api/auth/login", response_model=DashboardToken)
+def login_dashboard(credentials: DashboardLogin):
+    if not (
+        secrets.compare_digest(credentials.username, DASHBOARD_ADMIN_USERNAME)
+        and secrets.compare_digest(credentials.password, DASHBOARD_ADMIN_PASSWORD)
+    ):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    return {
+        "access_token": create_access_token(credentials.username),
+        "token_type": "bearer",
+        "expires_in": DASHBOARD_TOKEN_EXPIRE_SECONDS,
+    }
+
+
+@app.get("/api/auth/me", response_model=DashboardUser)
+def get_dashboard_user(request: Request):
+    return {"username": authenticated_username(request)}
 
 
 def build_copy_settings(settings: list) -> list[TradingCopySetting]:
@@ -85,12 +266,58 @@ def build_copy_settings(settings: list) -> list[TradingCopySetting]:
     return copy_settings
 
 
+def build_channel_destinations(destinations: list) -> list[ChannelDestination]:
+    built_destinations = []
+    for destination in destinations or []:
+        destination_handle = destination.destination_handle.strip()
+        if not destination_handle:
+            continue
+
+        custom_output_message = (
+            destination.custom_output_message.strip()
+            if destination.custom_output_message
+            else None
+        )
+        built_destinations.append(
+            ChannelDestination(
+                destination_name=destination.destination_name.strip() or destination_handle,
+                destination_handle=destination_handle,
+                is_active=destination.is_active,
+                use_rule_output=destination.use_rule_output,
+                custom_output_message=custom_output_message or None,
+            )
+        )
+
+    return built_destinations
+
+
 def replace_channel_copy_settings(db: Session, channel: Channel, settings: list) -> None:
     db.query(TradingCopySetting).filter(
         TradingCopySetting.channel_id == channel.id
     ).delete()
     db.flush()
     channel.copy_settings = build_copy_settings(settings)
+
+
+def replace_channel_destinations(db: Session, channel: Channel, destinations: list) -> None:
+    db.query(ChannelDestination).filter(
+        ChannelDestination.channel_id == channel.id
+    ).delete()
+    db.flush()
+    channel.destinations = build_channel_destinations(destinations)
+    channel.target_channel = first_active_destination_handle(channel.destinations)
+
+
+def first_active_destination_handle(destinations: list) -> str:
+    for destination in destinations or []:
+        if destination.is_active and destination.destination_handle:
+            return destination.destination_handle
+
+    for destination in destinations or []:
+        if destination.destination_handle:
+            return destination.destination_handle
+
+    return ""
 
 
 def active_copy_traders() -> dict[tuple[int, int], tuple[object, object]]:
@@ -101,14 +328,14 @@ def active_copy_traders() -> dict[tuple[int, int], tuple[object, object]]:
 
 def start_linked_copy_trader(bot_id: int, channel_id: int) -> None:
     traders = active_copy_traders()
-    key = (bot_id, channel_id)
+    key = ("reader", 0)
     if key in traders:
         _service, task = traders[key]
         if not task.done():
             return
         traders.pop(key)
 
-    service, task = start_copy_trader_background(bot_id, channel_id)
+    service, task = start_copy_trader_background()
     traders[key] = (service, task)
 
 
@@ -168,6 +395,7 @@ async def save_authorized_session(
     ).update({"is_active": False})
 
     session.session_string = client.session.save()
+    session.session_string = encrypt_text(session.session_string)
     session.phone_code_hash = None
     session.needs_password = False
     session.is_active = True
@@ -187,7 +415,7 @@ async def sign_in_pending_session(
     password: str | None = None,
 ) -> TelegramUserSession:
     client = TelegramClient(
-        StringSession(session.session_string or ""),
+        StringSession(decrypt_text(session.session_string) or ""),
         int(session.api_id),
         session.api_hash,
     )
@@ -205,7 +433,7 @@ async def sign_in_pending_session(
 
         return await save_authorized_session(db, session, client)
     except SessionPasswordNeededError:
-        session.session_string = client.session.save()
+        session.session_string = encrypt_text(client.session.save())
         session.needs_password = True
         session.updated_at = datetime.utcnow()
         db.commit()
@@ -224,6 +452,39 @@ def get_telegram_session_status(db: Session = Depends(get_db)):
     return telegram_session_status(active or latest_telegram_session(db))
 
 
+@app.get("/api/telegram-reader/status", response_model=TelegramReaderStatus)
+def get_telegram_reader_status(db: Session = Depends(get_db)):
+    service_task = active_copy_traders().get(("reader", 0))
+    if service_task:
+        service, task = service_task
+        status = service.get_status()
+        if task.done() and status.get("state") not in {"stopped", "invalid_session", "waiting_for_session"}:
+            status = {
+                **status,
+                "state": "stopped",
+                "is_running": False,
+                "is_authorized": False,
+                "last_error": "Telegram reader task is not running",
+            }
+    else:
+        status = {
+            "state": "not_started",
+            "is_running": False,
+            "is_authorized": False,
+            "last_error": None,
+            "last_connected_at": None,
+            "last_disconnected_at": None,
+            "reconnect_attempts": 0,
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+
+    active = db.query(TelegramUserSession).filter(
+        TelegramUserSession.is_active == True
+    ).order_by(TelegramUserSession.updated_at.desc()).first()
+    status["active_session"] = telegram_session_status(active or latest_telegram_session(db))
+    return status
+
+
 @app.post("/api/telegram-session/start", response_model=TelegramSessionStatus)
 async def start_telegram_login(login: TelegramLoginStart, db: Session = Depends(get_db)):
     client = TelegramClient(StringSession(), int(login.api_id), login.api_hash)
@@ -236,7 +497,7 @@ async def start_telegram_login(login: TelegramLoginStart, db: Session = Depends(
             api_id=login.api_id,
             api_hash=login.api_hash,
             phone_number=login.phone_number,
-            session_string=client.session.save(),
+            session_string=encrypt_text(client.session.save()),
             phone_code_hash=sent_code.phone_code_hash,
             is_active=False,
             needs_password=False,
@@ -298,13 +559,15 @@ async def logout_telegram_session(db: Session = Depends(get_db)):
 
 
 def get_copy_trader(bot_id: int, channel_id: int):
-    return active_copy_traders().get((bot_id, channel_id))
+    return active_copy_traders().get(("reader", 0))
 
 
 @app.on_event("startup")
 async def on_startup() -> None:
     create_tables()
     ensure_runtime_columns()
+    migrate_existing_channel_destinations()
+    encrypt_existing_telegram_sessions()
 
     auto_register = os.getenv("COPY_TRADER_AUTO_REGISTER", "false").lower() == "true"
     if auto_register:
@@ -332,7 +595,7 @@ async def on_shutdown() -> None:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -439,9 +702,21 @@ def create_channel(channel: ChannelCreate, db: Session = Depends(get_db)):
     if existing:
         raise HTTPException(status_code=400, detail="Channel with this name already exists")
     
-    channel_data = channel.dict(exclude={"copy_settings"})
+    channel_data = channel.dict(exclude={"copy_settings", "destinations"})
     db_channel = Channel(**channel_data)
     db_channel.copy_settings = build_copy_settings(channel.copy_settings)
+    db_channel.destinations = build_channel_destinations(channel.destinations)
+    if not db_channel.destinations and db_channel.target_channel:
+        db_channel.destinations = build_channel_destinations([
+            SimpleNamespace(
+                destination_name=db_channel.target_channel.lstrip("@") or "Default Destination",
+                destination_handle=db_channel.target_channel,
+                is_active=True,
+                use_rule_output=True,
+                custom_output_message=None,
+            )
+        ])
+    db_channel.target_channel = first_active_destination_handle(db_channel.destinations)
     db.add(db_channel)
     db.commit()
     db.refresh(db_channel)
@@ -496,7 +771,7 @@ async def post_channel_message(
 
     service, _task = service_task
     try:
-        await service.post_cms_message(post.message)
+        await service.post_cms_message(post.message, bot.id, channel.id, post.destination_ids)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -545,26 +820,23 @@ async def update_channel(channel_id: int, channel_update: ChannelUpdate, db: Ses
     if not channel:
         raise HTTPException(status_code=404, detail="Channel not found")
     
-    update_data = channel_update.dict(exclude_unset=True, exclude={"copy_settings"})
+    update_data = channel_update.dict(exclude_unset=True, exclude={"copy_settings", "destinations"})
     for key, value in update_data.items():
         setattr(channel, key, value)
 
     if channel_update.copy_settings is not None:
         replace_channel_copy_settings(db, channel, channel_update.copy_settings)
+    if channel_update.destinations is not None:
+        replace_channel_destinations(db, channel, channel_update.destinations)
+    elif "target_channel" in update_data:
+        channel.target_channel = update_data.get("target_channel") or ""
     
     channel.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(channel)
 
-    for bot in channel.bots:
-        service_task = active_copy_traders().pop((bot.id, channel.id), None)
-        if service_task:
-            service, task = service_task
-            await service.stop()
-            task.cancel()
-
-        if bot.is_active:
-            start_linked_copy_trader(bot.id, channel.id)
+    if any(bot.is_active for bot in channel.bots):
+        start_linked_copy_trader(channel.bots[0].id, channel.id)
 
     return channel
 
@@ -576,13 +848,6 @@ async def delete_channel(channel_id: int, db: Session = Depends(get_db)):
     if not channel:
         raise HTTPException(status_code=404, detail="Channel not found")
 
-    for bot in channel.bots:
-        service_task = active_copy_traders().pop((bot.id, channel.id), None)
-        if service_task:
-            service, task = service_task
-            await service.stop()
-            task.cancel()
-    
     db.delete(channel)
     db.commit()
     return {"message": "Channel deleted successfully"}
@@ -626,13 +891,6 @@ async def unlink_bot_channel(bot_id: int, channel_id: int, db: Session = Depends
         bot.channels.remove(channel)
         db.commit()
 
-    traders = active_copy_traders()
-    service_task = traders.pop((bot_id, channel_id), None)
-    if service_task:
-        service, task = service_task
-        await service.stop()
-        task.cancel()
-    
     return {"message": "Bot unlinked from channel successfully"}
 
 
