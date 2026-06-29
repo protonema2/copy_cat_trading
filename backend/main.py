@@ -437,8 +437,14 @@ def telegram_session_status(session: TelegramUserSession | None) -> dict:
     }
 
 
-def latest_telegram_session(db: Session) -> TelegramUserSession | None:
-    return db.query(TelegramUserSession).order_by(
+def pending_telegram_session(db: Session) -> TelegramUserSession | None:
+    return db.query(TelegramUserSession).filter(
+        TelegramUserSession.is_active == False,
+        (
+            TelegramUserSession.phone_code_hash.isnot(None)
+            | (TelegramUserSession.needs_password == True)
+        ),
+    ).order_by(
         TelegramUserSession.updated_at.desc(),
         TelegramUserSession.created_at.desc(),
     ).first()
@@ -510,7 +516,7 @@ def get_telegram_session_status(db: Session = Depends(get_db)):
         TelegramUserSession.is_active == True
     ).order_by(TelegramUserSession.updated_at.desc()).first()
 
-    return telegram_session_status(active or latest_telegram_session(db))
+    return telegram_session_status(active or pending_telegram_session(db))
 
 
 @app.get("/api/telegram-reader/status", response_model=TelegramReaderStatus)
@@ -542,7 +548,7 @@ def get_telegram_reader_status(db: Session = Depends(get_db)):
     active = db.query(TelegramUserSession).filter(
         TelegramUserSession.is_active == True
     ).order_by(TelegramUserSession.updated_at.desc()).first()
-    status["active_session"] = telegram_session_status(active or latest_telegram_session(db))
+    status["active_session"] = telegram_session_status(active) if active else None
     return status
 
 
@@ -575,8 +581,8 @@ async def start_telegram_login(login: TelegramLoginStart, db: Session = Depends(
 
 @app.post("/api/telegram-session/verify", response_model=TelegramSessionStatus)
 async def verify_telegram_login(login: TelegramLoginVerify, db: Session = Depends(get_db)):
-    session = latest_telegram_session(db)
-    if not session or session.is_active:
+    session = pending_telegram_session(db)
+    if not session or session.needs_password:
         raise HTTPException(status_code=400, detail="No pending Telegram login found")
 
     try:
@@ -592,7 +598,7 @@ async def verify_telegram_login(login: TelegramLoginVerify, db: Session = Depend
 
 @app.post("/api/telegram-session/password", response_model=TelegramSessionStatus)
 async def complete_telegram_2fa(login: TelegramLoginPassword, db: Session = Depends(get_db)):
-    session = latest_telegram_session(db)
+    session = pending_telegram_session(db)
     if not session or not session.needs_password:
         raise HTTPException(status_code=400, detail="No Telegram 2FA password is required")
 
