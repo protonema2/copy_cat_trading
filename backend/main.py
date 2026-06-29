@@ -327,6 +327,10 @@ def active_copy_traders() -> dict[tuple[int, int], tuple[object, object]]:
 
 
 def start_linked_copy_trader(bot_id: int, channel_id: int) -> None:
+    ensure_reader_running()
+
+
+def ensure_reader_running() -> None:
     traders = active_copy_traders()
     key = ("reader", 0)
     if key in traders:
@@ -555,6 +559,7 @@ async def logout_telegram_session(db: Session = Depends(get_db)):
         "phone_code_hash": None,
     })
     db.commit()
+    ensure_reader_running()
     return {"message": "Telegram user session deactivated"}
 
 
@@ -585,6 +590,7 @@ async def on_startup() -> None:
         start_all_active_copy_traders(db)
     finally:
         db.close()
+    ensure_reader_running()
 
 
 @app.on_event("shutdown")

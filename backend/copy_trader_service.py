@@ -44,6 +44,8 @@ class CopyTraderService:
         self.last_signals: dict[tuple[int, int], str] = {}
         self.stop_requested = False
         self.reconnect_attempts = 0
+        self.waiting_for_session_logged = False
+        self.last_alert_key: str | None = None
         self.status = {
             "state": "idle",
             "is_running": False,
@@ -59,46 +61,63 @@ class CopyTraderService:
         self.stop_requested = False
 
         while not self.stop_requested:
+            wait_for_session = False
             db = SessionLocal()
             try:
                 self.set_status("starting", is_running=False, is_authorized=False, last_error=None)
                 user_session = get_active_user_session(db)
                 if not user_session:
                     message = "Telegram user session is not active. Complete Telegram login in the dashboard before starting listeners."
-                    log_system_error(db, message)
+                    if not self.waiting_for_session_logged:
+                        log_system_error(db, message)
+                        self.waiting_for_session_logged = True
+                    await self.send_alert_once(
+                        db,
+                        "waiting_for_session",
+                        f"CopyCat alert: Telegram user session is not active. Copy forwarding is waiting for a new Telegram login.",
+                    )
                     self.set_status("waiting_for_session", is_running=False, is_authorized=False, last_error=message)
-                    return
-
-                self.reader_client = build_user_reader_client(user_session)
-
-                @self.reader_client.on(events.NewMessage)
-                async def handler(event):
-                    await self.handle_telegram_message(event.message, source="live")
-
-                await self.reader_client.connect()
-                if not await self.reader_client.is_user_authorized():
-                    message = "Telegram user session is not authorized. Log in the user session before starting the backend."
-                    log_system_error(db, message)
-                    user_session.is_active = False
-                    user_session.updated_at = datetime.utcnow()
-                    db.commit()
-                    await self.reader_client.disconnect()
                     self.ready.clear()
-                    self.set_status("invalid_session", is_running=False, is_authorized=False, last_error=message)
-                    return
+                    wait_for_session = True
+                else:
+                    self.waiting_for_session_logged = False
+                    self.reader_client = build_user_reader_client(user_session)
 
-                self.ready.set()
-                self.reconnect_attempts = 0
-                self.set_status(
-                    "connected",
-                    is_running=True,
-                    is_authorized=True,
-                    last_error=None,
-                    last_connected_at=datetime.utcnow().isoformat(),
-                    reconnect_attempts=0,
-                )
-                self.poll_task = asyncio.create_task(self.poll_recent_messages())
-                print("Copy trader reader started. Listening to active linked channels.")
+                    @self.reader_client.on(events.NewMessage)
+                    async def handler(event):
+                        await self.handle_telegram_message(event.message, source="live")
+
+                    await self.reader_client.connect()
+                    if not await self.reader_client.is_user_authorized():
+                        message = "Telegram user session is not authorized. Log in the user session before starting the backend."
+                        log_system_error(db, message)
+                        user_session.is_active = False
+                        user_session.updated_at = datetime.utcnow()
+                        db.commit()
+                        await self.reader_client.disconnect()
+                        self.reader_client = None
+                        self.ready.clear()
+                        await self.send_alert_once(
+                            db,
+                            "invalid_session",
+                            f"CopyCat alert: Telegram user session is invalid or unauthorized. Copy forwarding is paused until you log in again.",
+                        )
+                        self.set_status("invalid_session", is_running=False, is_authorized=False, last_error=message)
+                        wait_for_session = True
+                    else:
+                        self.ready.set()
+                        self.reconnect_attempts = 0
+                        self.last_alert_key = None
+                        self.set_status(
+                            "connected",
+                            is_running=True,
+                            is_authorized=True,
+                            last_error=None,
+                            last_connected_at=datetime.utcnow().isoformat(),
+                            reconnect_attempts=0,
+                        )
+                        self.poll_task = asyncio.create_task(self.poll_recent_messages())
+                        print("Copy trader reader started. Listening to active linked channels.")
             except Exception as exc:
                 db.rollback()
                 self.ready.clear()
@@ -114,6 +133,10 @@ class CopyTraderService:
             finally:
                 db.close()
 
+            if wait_for_session:
+                await self.wait_for_session_delay()
+                continue
+
             if not self.reader_client or not self.reader_client.is_connected():
                 await self.reconnect_delay()
                 continue
@@ -122,6 +145,11 @@ class CopyTraderService:
                 await self.reader_client.run_until_disconnected()
                 if not self.stop_requested:
                     self.reconnect_attempts += 1
+                    await self.send_alert_once(
+                        db=None,
+                        key="reader_disconnected",
+                        message="CopyCat alert: Telegram reader disconnected. The service will keep trying to reconnect.",
+                    )
                     self.set_status(
                         "disconnected",
                         is_running=False,
@@ -132,6 +160,11 @@ class CopyTraderService:
                     )
             except Exception as exc:
                 self.reconnect_attempts += 1
+                await self.send_alert_once(
+                    db=None,
+                    key="reader_disconnected",
+                    message=f"CopyCat alert: Telegram reader disconnected: {exc}. The service will keep trying to reconnect.",
+                )
                 self.set_status(
                     "disconnected",
                     is_running=False,
@@ -169,6 +202,16 @@ class CopyTraderService:
     async def reconnect_delay(self):
         delay = min(60, 5 * max(1, self.reconnect_attempts))
         await asyncio.sleep(delay)
+
+    async def wait_for_session_delay(self):
+        await asyncio.sleep(int(os.getenv("COPY_TRADER_SESSION_WAIT_SECONDS", "15")))
+
+    async def send_alert_once(self, db: Session | None, key: str, message: str) -> None:
+        if self.last_alert_key == key:
+            return
+
+        self.last_alert_key = key
+        await send_system_alert(db, message)
 
     def set_status(self, state: str, **updates):
         self.status.update(updates)
@@ -716,6 +759,27 @@ def log_system_error(
     )
     db.add(log)
     db.commit()
+
+
+async def send_system_alert(db: Session | None, message: str) -> None:
+    alert_chat_id = os.getenv("COPY_TRADER_ALERT_CHAT_ID", "").strip()
+    if not alert_chat_id:
+        return
+
+    owns_db = db is None
+    active_db = db or SessionLocal()
+    try:
+        bot = active_db.query(Bot).filter(Bot.is_active == True).first()
+        if not bot:
+            print(f"Could not send alert because no active bot exists: {message}")
+            return
+
+        await asyncio.to_thread(send_bot_message, bot.bot_token, alert_chat_id, message)
+    except Exception as exc:
+        print(f"Could not send Telegram alert: {exc}")
+    finally:
+        if owns_db:
+            active_db.close()
 
 
 async def post_with_bot_token(bot_id: int, target_channel: str, message: str) -> None:
