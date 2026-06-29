@@ -1,6 +1,6 @@
 import React from 'react'
 import { Link, useLocation } from 'react-router-dom'
-import { Bot, LogOut, PanelLeftClose, PanelLeftOpen, Radio, UserCog } from 'lucide-react'
+import { Bot, LogOut, PanelLeftClose, PanelLeftOpen, Radio, UserCog, Activity, Layers, BarChart2 } from 'lucide-react'
 
 export default function Sidebar({ user, collapsed, onToggleCollapse, onLogout }) {
   const location = useLocation()
@@ -68,6 +68,33 @@ export default function Sidebar({ user, collapsed, onToggleCollapse, onLogout })
         >
           <UserCog size={19} />
           <span className={collapsed ? 'lg:hidden' : ''}>Telegram</span>
+        </Link>
+
+        <Link
+          to="/signals"
+          className={`${navLinkClass('/signals')} ${collapsed ? 'lg:justify-center lg:px-3' : ''}`}
+          title="Signals"
+        >
+          <Activity size={19} />
+          <span className={collapsed ? 'lg:hidden' : ''}>Signals</span>
+        </Link>
+
+        <Link
+          to="/instrument-symbols"
+          className={`${navLinkClass('/instrument-symbols')} ${collapsed ? 'lg:justify-center lg:px-3' : ''}`}
+          title="Instrument Symbols"
+        >
+          <Layers size={19} />
+          <span className={collapsed ? 'lg:hidden' : ''}>Instruments</span>
+        </Link>
+
+        <Link
+          to="/performance"
+          className={`${navLinkClass('/performance')} ${collapsed ? 'lg:justify-center lg:px-3' : ''}`}
+          title="Channel Performance"
+        >
+          <BarChart2 size={19} />
+          <span className={collapsed ? 'lg:hidden' : ''}>Performance</span>
         </Link>
       </nav>
 

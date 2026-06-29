@@ -5,6 +5,9 @@ import BotListPage from './pages/BotListPage'
 import ChannelListPage from './pages/ChannelListPage'
 import BotDetailPage from './pages/BotDetailPage'
 import TelegramSessionPage from './pages/TelegramSessionPage'
+import SignalsPage from './pages/SignalsPage'
+import InstrumentSymbolsPage from './pages/InstrumentSymbolsPage'
+import ChannelPerformancePage from './pages/ChannelPerformancePage'
 import LoginPage from './pages/LoginPage'
 import { authApi, botApi, clearAuthToken, getAuthToken } from './api'
 
@@ -97,6 +100,10 @@ export default function App() {
               <Route path="/bots/:botId" element={<BotDetailPage onRefresh={refreshBots} />} />
               <Route path="/channels" element={<ChannelListPage onRefresh={refreshBots} />} />
               <Route path="/telegram-session" element={<TelegramSessionPage />} />
+              <Route path="/signals" element={<SignalsPage />} />
+              <Route path="/instrument-symbols" element={<InstrumentSymbolsPage />} />
+              <Route path="/performance" element={<ChannelPerformancePage />} />
+              <Route path="/performance/:channelId" element={<ChannelPerformancePage />} />
               <Route path="*" element={<Navigate to="/bots" />} />
             </Routes>
           </main>

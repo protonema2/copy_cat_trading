@@ -93,3 +93,35 @@ export const telegramSessionApi = {
   password: (password) => apiClient.post('/telegram-session/password', { password }),
   logout: () => apiClient.delete('/telegram-session'),
 }
+
+// Signals
+export const signalApi = {
+  list: (params = {}) => apiClient.get('/signals', { params }),
+  get: (id) => apiClient.get(`/signals/${id}`),
+  pendingBroadcasts: () => apiClient.get('/signals/pending-broadcasts'),
+  achieveTarget: (signalId, targetId, achievedBy = 'MANUAL') =>
+    apiClient.patch(`/signals/${signalId}/targets/${targetId}/achieve`, { achieved_by: achievedBy }),
+  markSLHit: (signalId, message, destinationIds) =>
+    apiClient.patch(`/signals/${signalId}/sl-hit`, { message, destination_ids: destinationIds }),
+  closeSignal: (signalId, exitPrice, closeType, message, destinationIds) =>
+    apiClient.patch(`/signals/${signalId}/close`, {
+      exit_price: exitPrice,
+      close_type: closeType,
+      message,
+      destination_ids: destinationIds,
+    }),
+}
+
+// Instrument symbol maps
+export const instrumentSymbolApi = {
+  list: () => apiClient.get('/instrument-symbols'),
+  create: (data) => apiClient.post('/instrument-symbols', data),
+  update: (id, data) => apiClient.patch(`/instrument-symbols/${id}`, data),
+  delete: (id) => apiClient.delete(`/instrument-symbols/${id}`),
+}
+
+// Channel performance stats
+export const channelStatsApi = {
+  all: (params = {}) => apiClient.get('/channels/stats', { params }),
+  get: (channelId, params = {}) => apiClient.get(`/channels/${channelId}/stats`, { params }),
+}

@@ -21,21 +21,23 @@ export default function Modal({ isOpen, title, onClose, children, onSubmit, load
           {children}
         </div>
 
-        <div className="flex flex-col-reverse gap-3 border-t border-gray-700 p-4 sm:flex-row sm:p-6 sm:pt-4">
-          <button
-            onClick={onClose}
-            className="flex-1 px-4 py-2 bg-gray-700 text-white rounded-lg hover:bg-gray-600 transition-colors"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={onSubmit}
-            disabled={loading}
-            className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50"
-          >
-            {loading ? 'Loading...' : 'Submit'}
-          </button>
-        </div>
+        {onSubmit && (
+          <div className="flex flex-col-reverse gap-3 border-t border-gray-700 p-4 sm:flex-row sm:p-6 sm:pt-4">
+            <button
+              onClick={onClose}
+              className="flex-1 px-4 py-2 bg-gray-700 text-white rounded-lg hover:bg-gray-600 transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={onSubmit}
+              disabled={loading}
+              className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50"
+            >
+              {loading ? 'Loading...' : 'Submit'}
+            </button>
+          </div>
+        )}
       </div>
     </div>
   )

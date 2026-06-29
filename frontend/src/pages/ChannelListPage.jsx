@@ -3,12 +3,32 @@ import { Plus, Trash2, Link as LinkIcon, RefreshCw, Send, Pencil, X } from 'luci
 import { channelApi, linkApi, botApi, ruleApi } from '../api'
 import Modal from '../components/Modal'
 
+const DEFAULT_SIGNAL_FIELD_MAP = {
+  emiten: 'emiten',
+  signal_type: 'direction',
+  entry_price: 'price',
+  stop_loss: 'sl',
+  targets: 'targets',
+}
+
+const parseSignalFieldMap = (value) => {
+  if (!value) return { ...DEFAULT_SIGNAL_FIELD_MAP }
+  try {
+    return { ...DEFAULT_SIGNAL_FIELD_MAP, ...JSON.parse(value) }
+  } catch {
+    return { ...DEFAULT_SIGNAL_FIELD_MAP }
+  }
+}
+
 const createEmptyCopySetting = (priority = 0) => ({
   rule_name: '',
   match_type: 'contains',
   filtered_message: '',
   output_message: '',
   priority,
+  signal_capture_enabled: false,
+  signal_field_map: JSON.stringify(DEFAULT_SIGNAL_FIELD_MAP),
+  signal_target_vars: '[]',
 })
 
 const createEmptyDestination = () => ({
@@ -193,6 +213,10 @@ export default function ChannelListPage({ onRefresh }) {
               rule_name: setting.rule_name || '',
               match_type: setting.match_type || 'contains',
               priority: setting.priority || 0,
+              signal_capture_enabled: setting.signal_capture_enabled === true,
+              signal_field_map:
+                setting.signal_field_map || JSON.stringify(DEFAULT_SIGNAL_FIELD_MAP),
+              signal_target_vars: setting.signal_target_vars || '[]',
             }))
           : [createEmptyCopySetting()],
     })
@@ -222,6 +246,9 @@ export default function ChannelListPage({ onRefresh }) {
         rule_name: setting.rule_name.trim(),
         match_type: setting.match_type,
         priority: index,
+        signal_capture_enabled: setting.signal_capture_enabled === true,
+        signal_field_map: setting.signal_field_map || JSON.stringify(DEFAULT_SIGNAL_FIELD_MAP),
+        signal_target_vars: setting.signal_target_vars || '[]',
       }))
       .filter((setting) => setting.filtered_message),
   })
@@ -232,6 +259,14 @@ export default function ChannelListPage({ onRefresh }) {
       copy_settings: prev.copy_settings.map((setting, settingIndex) =>
         settingIndex === index ? { ...setting, [field]: value } : setting
       ),
+    }))
+  }
+
+  const updateSignalField = (index, field, value) => {
+    const currentMap = parseSignalFieldMap(formData.copy_settings[index].signal_field_map)
+    updateCopySetting(index, 'signal_field_map', JSON.stringify({
+      ...currentMap,
+      [field]: value.trim(),
     }))
   }
 
@@ -483,6 +518,7 @@ export default function ChannelListPage({ onRefresh }) {
         }}
         onSubmit={handleCreateChannel}
         updateCopySetting={updateCopySetting}
+        updateSignalField={updateSignalField}
         addCopySetting={addCopySetting}
         removeCopySetting={removeCopySetting}
         rulePreviews={rulePreviews}
@@ -720,6 +756,7 @@ function ChannelFormModal({
   onClose,
   onSubmit,
   updateCopySetting,
+  updateSignalField,
   addCopySetting,
   removeCopySetting,
   rulePreviews,
@@ -898,6 +935,40 @@ function ChannelFormModal({
                       className="w-full min-w-0 resize-y rounded-lg border border-gray-600 bg-gray-700 px-3 py-2 text-white outline-none focus:border-blue-500"
                     />
                   </label>
+                </div>
+
+                <div className="space-y-3 border-t border-gray-700 pt-3">
+                  <label className="flex items-center gap-2 text-sm text-gray-200">
+                    <input
+                      type="checkbox"
+                      checked={setting.signal_capture_enabled === true}
+                      onChange={(e) => updateCopySetting(index, 'signal_capture_enabled', e.target.checked)}
+                      className="h-4 w-4"
+                    />
+                    Capture for Channel Performance
+                  </label>
+
+                  {setting.signal_capture_enabled && (
+                    <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
+                      {[
+                        ['emiten', 'Instrument group'],
+                        ['signal_type', 'Direction group'],
+                        ['entry_price', 'Entry group'],
+                        ['stop_loss', 'Stop-loss group'],
+                        ['targets', 'Targets block group'],
+                      ].map(([field, label]) => (
+                        <label key={field} className="block">
+                          <span className="mb-1 block text-xs text-gray-400">{label}</span>
+                          <input
+                            type="text"
+                            value={parseSignalFieldMap(setting.signal_field_map)[field] || ''}
+                            onChange={(e) => updateSignalField(index, field, e.target.value)}
+                            className="w-full min-w-0 rounded-lg border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-white outline-none focus:border-blue-500"
+                          />
+                        </label>
+                      ))}
+                    </div>
+                  )}
                 </div>
 
                 <div className="space-y-2">
