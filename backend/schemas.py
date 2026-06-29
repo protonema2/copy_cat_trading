@@ -79,6 +79,7 @@ class TradingCopySettingResponse(BaseModel):
 
 
 class ChannelDestinationCreate(BaseModel):
+    id: Optional[int] = None
     destination_name: str
     destination_handle: str
     is_active: bool = True

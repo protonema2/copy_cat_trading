@@ -171,6 +171,7 @@ export default function ChannelListPage({ onRefresh }) {
       destinations:
         channel.destinations && channel.destinations.length > 0
           ? channel.destinations.map((destination) => ({
+              id: destination.id,
               destination_name: destination.destination_name || '',
               destination_handle: destination.destination_handle || '',
               is_active: destination.is_active !== false,
@@ -205,6 +206,7 @@ export default function ChannelListPage({ onRefresh }) {
     destinations: formData.forward_message
       ? formData.destinations
           .map((destination) => ({
+            id: destination.id,
             destination_name: destination.destination_name.trim() || destination.destination_handle.trim(),
             destination_handle: destination.destination_handle.trim(),
             is_active: destination.is_active,

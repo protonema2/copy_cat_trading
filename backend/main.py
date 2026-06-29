@@ -300,12 +300,69 @@ def replace_channel_copy_settings(db: Session, channel: Channel, settings: list)
 
 
 def replace_channel_destinations(db: Session, channel: Channel, destinations: list) -> None:
-    db.query(ChannelDestination).filter(
-        ChannelDestination.channel_id == channel.id
-    ).delete()
+    existing_destinations = list(channel.destinations)
+    existing_by_id = {destination.id: destination for destination in existing_destinations}
+    unmatched_ids = set(existing_by_id)
+    synced_destinations = []
+
+    for destination_data in destinations or []:
+        destination_handle = destination_data.destination_handle.strip()
+        if not destination_handle:
+            continue
+
+        destination = None
+        destination_id = getattr(destination_data, "id", None)
+        if destination_id is not None:
+            destination = existing_by_id.get(destination_id)
+            if destination is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Destination {destination_id} does not belong to this channel",
+                )
+        else:
+            # Keep compatibility with clients that predate destination IDs in update payloads.
+            destination = next(
+                (
+                    candidate
+                    for candidate in existing_destinations
+                    if candidate.id in unmatched_ids
+                    and candidate.destination_handle == destination_handle
+                ),
+                None,
+            )
+
+        if destination is None:
+            destination = ChannelDestination(channel=channel)
+            db.add(destination)
+        else:
+            unmatched_ids.discard(destination.id)
+
+        custom_output_message = (
+            destination_data.custom_output_message.strip()
+            if destination_data.custom_output_message
+            else None
+        )
+        destination.destination_name = (
+            destination_data.destination_name.strip() or destination_handle
+        )
+        destination.destination_handle = destination_handle
+        destination.is_active = destination_data.is_active
+        destination.use_rule_output = destination_data.use_rule_output
+        destination.custom_output_message = custom_output_message or None
+        synced_destinations.append(destination)
+
+    if unmatched_ids:
+        db.query(ActivityLog).filter(
+            ActivityLog.destination_id.in_(unmatched_ids)
+        ).update(
+            {ActivityLog.destination_id: None},
+            synchronize_session=False,
+        )
+        for destination_id in unmatched_ids:
+            db.delete(existing_by_id[destination_id])
+
     db.flush()
-    channel.destinations = build_channel_destinations(destinations)
-    channel.target_channel = first_active_destination_handle(channel.destinations)
+    channel.target_channel = first_active_destination_handle(synced_destinations)
 
 
 def first_active_destination_handle(destinations: list) -> str:
