@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -18,10 +20,12 @@ import os
 import secrets
 import time
 
+from .channel_stats_service import compute_channel_stats, compute_all_channels_stats
 from .copy_trader_service import register_configured_copy_trader, start_copy_trader_background
+from .price_feed_service import get_ohlc_range, get_prices
 from .database import engine, get_db, Base, SessionLocal
 from .message_rules import apply_copy_setting
-from .models import Bot, Channel, ChannelDestination, ActivityLog, TelegramUserSession, TradingCopySetting, bot_channel_association
+from .models import Bot, Channel, ChannelDestination, ActivityLog, TelegramUserSession, TradingCopySetting, ProcessedTelegramMessage, bot_channel_association, Signal, SignalTarget, InstrumentSymbolMap
 from .security import decrypt_text, encrypt_text, is_encrypted
 from .schemas import (
     DashboardLogin, DashboardToken, DashboardUser,
@@ -30,7 +34,10 @@ from .schemas import (
     ActivityLogResponse, ActivityLogCreate, ChannelPostCreate,
     RulePreviewRequest, RulePreviewResponse,
     TelegramSessionStatus, TelegramLoginStart, TelegramLoginVerify, TelegramLoginPassword,
-    TelegramReaderStatus, BotChannelLink
+    TelegramReaderStatus, BotChannelLink,
+    SignalResponse, SignalTargetResponse, SignalTargetAchieveRequest, SignalSLHitRequest, SignalCloseRequest,
+    InstrumentSymbolMapCreate, InstrumentSymbolMapUpdate, InstrumentSymbolMapResponse,
+    ChannelStatsResponse,
 )
 
 def create_tables() -> None:
@@ -77,8 +84,19 @@ def ensure_runtime_columns() -> None:
                 conn.execute(text("ALTER TABLE trading_copy_settings ADD COLUMN match_type VARCHAR"))
             if "priority" not in setting_columns:
                 conn.execute(text("ALTER TABLE trading_copy_settings ADD COLUMN priority INTEGER"))
+            if "signal_capture_enabled" not in setting_columns:
+                conn.execute(text("ALTER TABLE trading_copy_settings ADD COLUMN signal_capture_enabled BOOLEAN DEFAULT FALSE"))
+            if "signal_field_map" not in setting_columns:
+                conn.execute(text("ALTER TABLE trading_copy_settings ADD COLUMN signal_field_map TEXT"))
+            if "signal_target_vars" not in setting_columns:
+                conn.execute(text("ALTER TABLE trading_copy_settings ADD COLUMN signal_target_vars TEXT"))
             conn.execute(text("UPDATE trading_copy_settings SET match_type = 'contains' WHERE match_type IS NULL"))
             conn.execute(text("UPDATE trading_copy_settings SET priority = 0 WHERE priority IS NULL"))
+
+        if "signals" in table_names:
+            signal_columns = {column["name"] for column in inspector.get_columns("signals")}
+            if "exit_price" not in signal_columns:
+                conn.execute(text("ALTER TABLE signals ADD COLUMN exit_price REAL"))
 
 
 def encrypt_existing_telegram_sessions() -> None:
@@ -260,6 +278,9 @@ def build_copy_settings(settings: list) -> list[TradingCopySetting]:
                 filtered_message=filtered_message,
                 output_message=output_message or None,
                 priority=setting.priority if setting.priority is not None else index,
+                signal_capture_enabled=getattr(setting, "signal_capture_enabled", False) or False,
+                signal_field_map=getattr(setting, "signal_field_map", None),
+                signal_target_vars=getattr(setting, "signal_target_vars", None),
             )
         )
 
@@ -418,6 +439,150 @@ async def stop_all_copy_traders() -> None:
         await service.stop()
         task.cancel()
     traders.clear()
+
+
+# ==================== PRICE POLLER ====================
+
+async def _price_poller_loop() -> None:
+    interval = int(os.getenv("PRICE_POLL_INTERVAL_SECONDS", "120"))
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            await _run_price_check()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            print(f"Price poller loop error: {exc}")
+
+
+async def _run_price_check() -> None:
+    db = SessionLocal()
+    try:
+        open_signals = (
+            db.query(Signal)
+            .filter(Signal.status == "OPEN", Signal.price_feed_symbol.isnot(None))
+            .all()
+        )
+        if not open_signals:
+            return
+
+        symbols = list({s.price_feed_symbol for s in open_signals})
+        interval = int(os.getenv("PRICE_POLL_INTERVAL_SECONDS", "120"))
+
+        # Prefer OHLC range (high/low over the interval) so intra-interval TP/SL breaches
+        # are not missed. Falls back to snapshot price if the time_series call fails.
+        try:
+            ohlc_ranges = get_ohlc_range(symbols, interval)
+        except Exception as exc:
+            print(f"OHLC fetch failed, falling back to snapshot prices: {exc}")
+            ohlc_ranges = {}
+
+        if not ohlc_ranges:
+            try:
+                snapshot = get_prices(symbols)
+                ohlc_ranges = {sym: (p, p) for sym, p in snapshot.items()}
+            except Exception as exc:
+                print(f"Price fetch skipped this cycle: {exc}")
+                return
+
+        auto_broadcast = os.getenv("AUTO_BROADCAST_SL_HIT", "false").lower() == "true"
+
+        for signal in open_signals:
+            hl = ohlc_ranges.get(signal.price_feed_symbol)
+            if hl is None:
+                continue
+            try:
+                await _check_signal_price(db, signal, hl[0], hl[1], auto_broadcast)
+            except Exception as exc:
+                print(f"Signal {signal.id} price check failed: {exc}")
+    finally:
+        db.close()
+
+
+async def _check_signal_price(db, signal: Signal, candle_high: float, candle_low: float, auto_broadcast: bool) -> None:
+    direction = (signal.signal_type or "").upper()
+    if direction not in ("BUY", "SELL"):
+        return
+
+    is_buy = direction == "BUY"
+    # For direction: BUY  — TP is hit when candle HIGH reaches target; SL when candle LOW drops to stop.
+    #                SELL — TP is hit when candle LOW  reaches target; SL when candle HIGH rises to stop.
+    tp_probe = candle_high if is_buy else candle_low
+    sl_probe = candle_low if is_buy else candle_high
+    changed = False
+
+    # Check unachieved targets
+    for target in signal.targets:
+        if target.achieved:
+            continue
+        hit = tp_probe >= target.price if is_buy else tp_probe <= target.price
+        if hit:
+            target.achieved = True
+            target.achieved_at = datetime.utcnow()
+            target.achieved_by = "AUTO"
+            changed = True
+
+    if changed:
+        all_achieved = all(t.achieved for t in signal.targets)
+        if all_achieved and signal.targets:
+            signal.status = "TP_HIT"
+        signal.updated_at = datetime.utcnow()
+        db.commit()
+        return  # don't also fire SL check in same cycle if targets just hit
+
+    # Check stop-loss
+    if signal.stop_loss is not None:
+        sl_hit = sl_probe <= signal.stop_loss if is_buy else sl_probe >= signal.stop_loss
+        if sl_hit:
+            signal.status = "SL_HIT"
+            signal.updated_at = datetime.utcnow()
+
+            bot = db.query(Bot).filter(Bot.id == signal.bot_id).first()
+            if bot:
+                db.add(ActivityLog(
+                    bot_id=bot.id,
+                    channel_id=signal.channel_id,
+                    message=(
+                        f"Auto-detected SL hit for signal {signal.id} ({signal.emiten}): "
+                        f"candle_low={candle_low}, candle_high={candle_high}, SL={signal.stop_loss}"
+                    ),
+                    log_type="signal_sl_hit",
+                ))
+
+            if auto_broadcast:
+                default_msg = (
+                    f"⛔ SL Hit\n{signal.emiten or 'Signal'} {signal.signal_type}\n"
+                    f"Entry: {signal.entry_price}  SL: {signal.stop_loss}"
+                )
+                channel = db.query(Channel).filter(Channel.id == signal.channel_id).first()
+                if channel and bot:
+                    from .copy_trader_service import get_active_destinations, post_with_bot_token
+                    for dest in get_active_destinations(channel):
+                        try:
+                            await post_with_bot_token(bot.id, dest.destination_handle, default_msg)
+                        except Exception as exc:
+                            print(f"Auto SL broadcast to {dest.destination_handle} failed: {exc}")
+            else:
+                signal.pending_sl_broadcast = True
+
+            db.commit()
+
+
+def ensure_price_poller_running() -> None:
+    task = getattr(app.state, "price_poller_task", None)
+    if task and not task.done():
+        return
+    app.state.price_poller_task = asyncio.create_task(_price_poller_loop())
+
+
+async def stop_price_poller() -> None:
+    task = getattr(app.state, "price_poller_task", None)
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 def telegram_session_status(session: TelegramUserSession | None) -> dict:
@@ -654,11 +819,13 @@ async def on_startup() -> None:
     finally:
         db.close()
     ensure_reader_running()
+    ensure_price_poller_running()
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     await stop_all_copy_traders()
+    await stop_price_poller()
 
 # CORS middleware
 
@@ -762,6 +929,17 @@ async def toggle_bot(bot_id: int, db: Session = Depends(get_db)):
 def list_channels(db: Session = Depends(get_db)):
     """Get all channels"""
     return db.query(Channel).all()
+
+
+@app.get("/api/channels/stats", response_model=list[ChannelStatsResponse])
+def get_all_channels_stats(
+    from_date: str | None = Query(None, alias="from"),
+    to_date: str | None = Query(None, alias="to"),
+    db: Session = Depends(get_db),
+):
+    from_dt = _parse_date_param(from_date)
+    to_dt = _parse_date_param(to_date, end_of_day=True)
+    return compute_all_channels_stats(db, from_dt, to_dt)
 
 
 @app.post("/api/channels", response_model=ChannelResponse)
@@ -916,6 +1094,36 @@ async def delete_channel(channel_id: int, db: Session = Depends(get_db)):
     channel = db.query(Channel).filter(Channel.id == channel_id).first()
     if not channel:
         raise HTTPException(status_code=404, detail="Channel not found")
+
+    destination_ids = [
+        destination_id
+        for (destination_id,) in db.query(ChannelDestination.id).filter(
+            ChannelDestination.channel_id == channel_id
+        ).all()
+    ]
+    if destination_ids:
+        db.query(ActivityLog).filter(
+            ActivityLog.destination_id.in_(destination_ids)
+        ).update(
+            {ActivityLog.destination_id: None},
+            synchronize_session=False,
+        )
+
+    db.query(ActivityLog).filter(
+        ActivityLog.channel_id == channel_id
+    ).update(
+        {ActivityLog.channel_id: None},
+        synchronize_session=False,
+    )
+    db.query(Signal).filter(
+        Signal.channel_id == channel_id
+    ).update(
+        {Signal.channel_id: None},
+        synchronize_session=False,
+    )
+    db.query(ProcessedTelegramMessage).filter(
+        ProcessedTelegramMessage.channel_id == channel_id
+    ).delete(synchronize_session=False)
 
     db.delete(channel)
     db.commit()
@@ -1105,6 +1313,258 @@ async def notify_log(
     })
     
     return log
+
+
+# ==================== CHANNEL PERFORMANCE STATS ====================
+
+@app.get("/api/channels/{channel_id}/stats", response_model=ChannelStatsResponse)
+def get_channel_stats(
+    channel_id: int,
+    from_date: str | None = Query(None, alias="from"),
+    to_date: str | None = Query(None, alias="to"),
+    db: Session = Depends(get_db),
+):
+    from_dt = _parse_date_param(from_date)
+    to_dt = _parse_date_param(to_date, end_of_day=True)
+    stats = compute_channel_stats(db, channel_id, from_dt, to_dt)
+    if not stats:
+        raise HTTPException(status_code=404, detail="Channel not found")
+    return stats
+
+
+def _parse_date_param(value: str | None, end_of_day: bool = False) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.strptime(value, "%Y-%m-%d")
+        if end_of_day:
+            dt = dt.replace(hour=23, minute=59, second=59)
+        return dt
+    except ValueError:
+        return None
+
+
+# ==================== INSTRUMENT SYMBOL MAP ====================
+
+@app.get("/api/instrument-symbols", response_model=list[InstrumentSymbolMapResponse])
+def list_instrument_symbols(db: Session = Depends(get_db)):
+    return db.query(InstrumentSymbolMap).order_by(InstrumentSymbolMap.display_name).all()
+
+
+@app.post("/api/instrument-symbols", response_model=InstrumentSymbolMapResponse)
+def create_instrument_symbol(body: InstrumentSymbolMapCreate, db: Session = Depends(get_db)):
+    existing = db.query(InstrumentSymbolMap).filter(
+        InstrumentSymbolMap.display_name.ilike(body.display_name)
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="display_name already exists")
+    obj = InstrumentSymbolMap(**body.dict())
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+@app.patch("/api/instrument-symbols/{symbol_id}", response_model=InstrumentSymbolMapResponse)
+def update_instrument_symbol(symbol_id: int, body: InstrumentSymbolMapUpdate, db: Session = Depends(get_db)):
+    obj = db.query(InstrumentSymbolMap).filter(InstrumentSymbolMap.id == symbol_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Not found")
+    for key, val in body.dict(exclude_unset=True).items():
+        setattr(obj, key, val)
+    obj.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+@app.delete("/api/instrument-symbols/{symbol_id}")
+def delete_instrument_symbol(symbol_id: int, db: Session = Depends(get_db)):
+    obj = db.query(InstrumentSymbolMap).filter(InstrumentSymbolMap.id == symbol_id).first()
+    if not obj:
+        raise HTTPException(status_code=404, detail="Not found")
+    db.delete(obj)
+    db.commit()
+    return {"message": "Deleted"}
+
+
+# ==================== SIGNALS ====================
+
+# NOTE: /api/signals/pending-broadcasts is registered BEFORE /api/signals/{id} so the
+# literal path segment "pending-broadcasts" is matched before the int converter tries to parse it.
+
+@app.get("/api/signals/pending-broadcasts", response_model=list[SignalResponse])
+def list_pending_sl_broadcasts(db: Session = Depends(get_db)):
+    return (
+        db.query(Signal)
+        .filter(Signal.pending_sl_broadcast == True)
+        .order_by(Signal.updated_at.desc())
+        .all()
+    )
+
+
+@app.get("/api/signals", response_model=list[SignalResponse])
+def list_signals(
+    bot_id: int | None = Query(None),
+    channel_id: int | None = Query(None),
+    status: str | None = Query(None),
+    limit: int = Query(200, le=1000),
+    skip: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    q = db.query(Signal)
+    if bot_id is not None:
+        q = q.filter(Signal.bot_id == bot_id)
+    if channel_id is not None:
+        q = q.filter(Signal.channel_id == channel_id)
+    if status:
+        q = q.filter(Signal.status == status.upper())
+    return q.order_by(Signal.created_at.desc()).offset(skip).limit(limit).all()
+
+
+@app.get("/api/signals/{signal_id}", response_model=SignalResponse)
+def get_signal(signal_id: int, db: Session = Depends(get_db)):
+    signal = db.query(Signal).filter(Signal.id == signal_id).first()
+    if not signal:
+        raise HTTPException(status_code=404, detail="Signal not found")
+    return signal
+
+
+@app.patch("/api/signals/{signal_id}/targets/{target_id}/achieve", response_model=SignalTargetResponse)
+def achieve_signal_target(
+    signal_id: int,
+    target_id: int,
+    body: SignalTargetAchieveRequest,
+    db: Session = Depends(get_db),
+):
+    signal = db.query(Signal).filter(Signal.id == signal_id).first()
+    if not signal:
+        raise HTTPException(status_code=404, detail="Signal not found")
+    target = db.query(SignalTarget).filter(
+        SignalTarget.id == target_id, SignalTarget.signal_id == signal_id
+    ).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Target not found")
+
+    target.achieved = True
+    target.achieved_at = datetime.utcnow()
+    target.achieved_by = body.achieved_by or "MANUAL"
+
+    # Promote signal to TP_HIT if all targets are now achieved
+    all_achieved = all(t.achieved for t in signal.targets)
+    if all_achieved:
+        signal.status = "TP_HIT"
+    signal.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(target)
+    return target
+
+
+@app.patch("/api/signals/{signal_id}/sl-hit")
+async def mark_signal_sl_hit(
+    signal_id: int,
+    body: SignalSLHitRequest,
+    db: Session = Depends(get_db),
+):
+    signal = db.query(Signal).filter(Signal.id == signal_id).first()
+    if not signal:
+        raise HTTPException(status_code=404, detail="Signal not found")
+
+    signal.status = "SL_HIT"
+    signal.pending_sl_broadcast = False
+    signal.updated_at = datetime.utcnow()
+
+    bot = db.query(Bot).filter(Bot.id == signal.bot_id).first()
+    if bot:
+        db.add(ActivityLog(
+            bot_id=bot.id,
+            channel_id=signal.channel_id,
+            message=f"SL hit confirmed for signal {signal.id} ({signal.emiten})",
+            log_type="signal_sl_hit",
+        ))
+
+    db.commit()
+
+    # Optionally broadcast to selected destinations
+    if body.message and body.message.strip() and signal.channel_id:
+        channel = db.query(Channel).filter(Channel.id == signal.channel_id).first()
+        if channel and bot:
+            from .copy_trader_service import get_active_destinations, post_with_bot_token
+            dests = get_active_destinations(channel)
+            if body.destination_ids:
+                selected_ids = set(body.destination_ids)
+                dests = [d for d in dests if d.id in selected_ids]
+            for dest in dests:
+                try:
+                    await post_with_bot_token(bot.id, dest.destination_handle, body.message.strip())
+                except Exception as exc:
+                    print(f"SL broadcast to {dest.destination_handle} failed: {exc}")
+
+    return {"message": "Signal marked as SL hit"}
+
+
+@app.get("/api/signals/{signal_id}/current-price")
+def get_signal_current_price(signal_id: int, db: Session = Depends(get_db)):
+    signal = db.query(Signal).filter(Signal.id == signal_id).first()
+    if not signal:
+        raise HTTPException(status_code=404, detail="Signal not found")
+    if not signal.price_feed_symbol:
+        raise HTTPException(status_code=400, detail="Signal has no price_feed_symbol configured")
+    try:
+        prices = get_prices([signal.price_feed_symbol])
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    price = prices.get(signal.price_feed_symbol)
+    if price is None:
+        raise HTTPException(status_code=502, detail=f"Could not fetch price for {signal.price_feed_symbol}")
+    return {"symbol": signal.price_feed_symbol, "price": price}
+
+
+@app.patch("/api/signals/{signal_id}/close")
+async def close_signal(
+    signal_id: int,
+    body: SignalCloseRequest,
+    db: Session = Depends(get_db),
+):
+    signal = db.query(Signal).filter(Signal.id == signal_id).first()
+    if not signal:
+        raise HTTPException(status_code=404, detail="Signal not found")
+    if signal.status != "OPEN":
+        raise HTTPException(status_code=400, detail=f"Signal is already {signal.status}")
+
+    signal.status = "CLOSED"
+    signal.exit_price = body.exit_price
+    signal.updated_at = datetime.utcnow()
+
+    bot = db.query(Bot).filter(Bot.id == signal.bot_id).first()
+    if bot:
+        db.add(ActivityLog(
+            bot_id=bot.id,
+            channel_id=signal.channel_id,
+            message=(
+                f"{body.close_type} confirmed for signal {signal.id} ({signal.emiten}): "
+                f"entry={signal.entry_price}, exit={body.exit_price}"
+            ),
+            log_type="signal_closed",
+        ))
+
+    db.commit()
+
+    if body.message and body.message.strip() and signal.channel_id:
+        channel = db.query(Channel).filter(Channel.id == signal.channel_id).first()
+        if channel and bot:
+            from .copy_trader_service import get_active_destinations, post_with_bot_token
+            dests = get_active_destinations(channel)
+            if body.destination_ids:
+                selected_ids = set(body.destination_ids)
+                dests = [d for d in dests if d.id in selected_ids]
+            for dest in dests:
+                try:
+                    await post_with_bot_token(bot.id, dest.destination_handle, body.message.strip())
+                except Exception as exc:
+                    print(f"Close broadcast to {dest.destination_handle} failed: {exc}")
+
+    return {"message": f"Signal {body.close_type}"}
 
 
 # ==================== HEALTH CHECK ====================

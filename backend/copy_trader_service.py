@@ -19,7 +19,10 @@ from .models import (
     Bot,
     Channel,
     ChannelDestination,
+    InstrumentSymbolMap,
     ProcessedTelegramMessage,
+    Signal,
+    SignalTarget,
     TelegramUserSession,
 )
 from .security import decrypt_text
@@ -421,6 +424,14 @@ class CopyTraderService:
                 )
                 return
 
+            # Phase 1: persist signal from matched rule variables (never blocks pipeline)
+            matched_setting = next(
+                (s for s in channel.copy_settings if s.id == configured_output.setting_id),
+                None,
+            )
+            if matched_setting:
+                capture_signal(db, bot.id, channel.id, telegram_message_id, text, configured_output, matched_setting)
+
             try:
                 await self.post_to_destinations(
                     db,
@@ -739,6 +750,137 @@ def calculate_delay_seconds(telegram_message_date: datetime | None) -> int | Non
         return None
 
     return max(0, int((datetime.utcnow() - telegram_message_date).total_seconds()))
+
+
+def _parse_float(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (ValueError, TypeError):
+        match = re.search(r"\d+(?:[.,]\d+)?", str(value))
+        if not match:
+            return None
+        try:
+            return float(match.group(0).replace(",", ""))
+        except (ValueError, TypeError):
+            return None
+
+
+def _parse_target_prices(value: str | None) -> list[float]:
+    if not value:
+        return []
+
+    prices = []
+    pattern = r"TP\s*[\d\u00b9\u00b2\u00b3\u2070\u2074-\u2079]*\s*[:\-]?\s*(\d+(?:[.,]\d+)?)"
+    for match in re.finditer(pattern, str(value), re.IGNORECASE):
+        price = _parse_float(match.group(1))
+        if price is not None:
+            prices.append(price)
+    return prices
+
+
+def capture_signal(
+    db: Session,
+    bot_id: int,
+    channel_id: int,
+    source_message_id: int | None,
+    raw_message: str,
+    rule_result,
+    setting,
+) -> None:
+    """Persist a Signal + SignalTargets from a matched rule result. Never raises — errors are swallowed so they never block the copy-and-post pipeline."""
+    try:
+        if not getattr(setting, "signal_capture_enabled", False):
+            return
+
+        field_map: dict = {}
+        if setting.signal_field_map:
+            try:
+                field_map = json.loads(setting.signal_field_map)
+            except Exception:
+                pass
+
+        target_var_specs: list = []
+        if setting.signal_target_vars:
+            try:
+                target_var_specs = json.loads(setting.signal_target_vars)
+            except Exception:
+                pass
+
+        variables: dict = rule_result.variables or {}
+
+        def get_var(field_name: str) -> str | None:
+            var_name = field_map.get(field_name)
+            return variables.get(var_name) if var_name else None
+
+        emiten = get_var("emiten")
+
+        raw_type = get_var("signal_type") or ""
+        upper_type = raw_type.upper()
+        if "BUY" in upper_type:
+            signal_type = "BUY"
+        elif "SELL" in upper_type:
+            signal_type = "SELL"
+        else:
+            signal_type = None
+
+        entry_price = _parse_float(get_var("entry_price"))
+        stop_loss = _parse_float(get_var("stop_loss"))
+        target_prices = _parse_target_prices(get_var("targets"))
+
+        # Resolve price_feed_symbol from InstrumentSymbolMap if emiten is known
+        price_feed_symbol: str | None = None
+        if emiten:
+            mapping = (
+                db.query(InstrumentSymbolMap)
+                .filter(
+                    InstrumentSymbolMap.display_name.ilike(emiten),
+                    InstrumentSymbolMap.active == True,
+                )
+                .first()
+            )
+            if mapping:
+                price_feed_symbol = mapping.price_feed_symbol
+
+        signal = Signal(
+            bot_id=bot_id,
+            channel_id=channel_id,
+            source_message_id=source_message_id,
+            emiten=emiten,
+            price_feed_symbol=price_feed_symbol,
+            signal_type=signal_type,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            status="OPEN",
+            pending_sl_broadcast=False,
+            raw_message=raw_message,
+        )
+        db.add(signal)
+        db.flush()  # populate signal.id before creating targets
+
+        for index, price in enumerate(target_prices, start=1):
+            db.add(SignalTarget(signal_id=signal.id, label=f"TP{index}", price=price))
+
+        for spec in target_var_specs:
+            label = spec.get("label", "TP")
+            var_name = spec.get("var", "")
+            price_val = _parse_float(variables.get(var_name))
+            if price_val is None:
+                continue
+            db.add(SignalTarget(signal_id=signal.id, label=label, price=price_val))
+
+        db.commit()
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        # Log failure without raising so the pipeline continues
+        try:
+            log_system_error(db, f"Signal capture failed (setting {getattr(setting, 'id', '?')}): {exc}", channel_id=channel_id)
+        except Exception:
+            pass
 
 
 def log_system_error(

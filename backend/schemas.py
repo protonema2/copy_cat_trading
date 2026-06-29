@@ -61,6 +61,9 @@ class TradingCopySettingCreate(BaseModel):
     filtered_message: str
     output_message: Optional[str] = None
     priority: int = 0
+    signal_capture_enabled: bool = False
+    signal_field_map: Optional[str] = None   # JSON string
+    signal_target_vars: Optional[str] = None  # JSON string
 
 
 class TradingCopySettingResponse(BaseModel):
@@ -71,6 +74,9 @@ class TradingCopySettingResponse(BaseModel):
     filtered_message: str
     output_message: Optional[str] = None
     priority: int
+    signal_capture_enabled: bool = False
+    signal_field_map: Optional[str] = None
+    signal_target_vars: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -228,5 +234,105 @@ class BotChannelLink(BaseModel):
     channel_id: int
 
 
+class SignalTargetResponse(BaseModel):
+    id: int
+    signal_id: int
+    label: str
+    price: float
+    achieved: bool
+    achieved_at: Optional[datetime] = None
+    achieved_by: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class SignalResponse(BaseModel):
+    id: int
+    bot_id: Optional[int] = None
+    channel_id: Optional[int] = None
+    source_message_id: Optional[int] = None
+    emiten: Optional[str] = None
+    price_feed_symbol: Optional[str] = None
+    signal_type: Optional[str] = None
+    entry_price: Optional[float] = None
+    stop_loss: Optional[float] = None
+    exit_price: Optional[float] = None
+    status: str
+    pending_sl_broadcast: bool = False
+    raw_message: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    targets: List["SignalTargetResponse"] = []
+
+    class Config:
+        from_attributes = True
+
+
+class SignalTargetAchieveRequest(BaseModel):
+    achieved_by: str = "MANUAL"
+
+
+class SignalSLHitRequest(BaseModel):
+    message: Optional[str] = None
+    destination_ids: Optional[List[int]] = None
+
+
+class SignalCloseRequest(BaseModel):
+    exit_price: Optional[float] = None
+    close_type: str = "CLOSED"   # "CUT_PROFIT" or "CUT_LOSS" (stored as CLOSED status, type in log)
+    message: Optional[str] = None
+    destination_ids: Optional[List[int]] = None
+
+
+class InstrumentSymbolMapCreate(BaseModel):
+    display_name: str
+    price_feed_symbol: str
+    active: bool = True
+
+
+class InstrumentSymbolMapUpdate(BaseModel):
+    display_name: Optional[str] = None
+    price_feed_symbol: Optional[str] = None
+    active: Optional[bool] = None
+
+
+class InstrumentSymbolMapResponse(BaseModel):
+    id: int
+    display_name: str
+    price_feed_symbol: str
+    active: bool
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class DailySignalCount(BaseModel):
+    date: str
+    count: int
+
+
+class ChannelStatsResponse(BaseModel):
+    channel_id: int
+    channel_name: str
+    total_signals: int
+    open_count: int
+    tp_hit_count: int
+    sl_hit_count: int
+    closed_count: int
+    win_rate: Optional[float] = None
+    sl_hit_rate: Optional[float] = None
+    avg_targets_achieved: Optional[float] = None
+    buy_win_rate: Optional[float] = None
+    sell_win_rate: Optional[float] = None
+    avg_time_to_resolution_hours: Optional[float] = None
+    signals_per_day: Optional[float] = None
+    total_pips: Optional[float] = None
+    daily_counts: List[DailySignalCount] = []
+
+
 BotDetailResponse.model_rebuild()
 ChannelDetailResponse.model_rebuild()
+SignalResponse.model_rebuild()

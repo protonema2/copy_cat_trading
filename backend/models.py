@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, ForeignKey, Table, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Float, Text, ForeignKey, Table, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from datetime import datetime
@@ -90,6 +90,10 @@ class TradingCopySetting(Base):
     filtered_message = Column(Text)
     output_message = Column(Text, nullable=True)
     priority = Column(Integer, default=0)
+    # Signal capture config — JSON-encoded field maps set per rule by the operator
+    signal_capture_enabled = Column(Boolean, default=False)
+    signal_field_map = Column(Text, nullable=True)   # JSON: {"emiten":"var","entry_price":"var",...}
+    signal_target_vars = Column(Text, nullable=True)  # JSON: [{"label":"TP1","var":"tp1"},...]
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -150,3 +154,53 @@ class ProcessedTelegramMessage(Base):
     telegram_message_id = Column(Integer, index=True)
     telegram_message_date = Column(DateTime, nullable=True)
     processed_at = Column(DateTime, server_default=func.now(), index=True)
+
+
+class InstrumentSymbolMap(Base):
+    """Maps operator-typed names (e.g. "GOLD", "XAUUSD") to price-feed symbols (e.g. "XAU/USD")."""
+    __tablename__ = "instrument_symbol_maps"
+
+    id = Column(Integer, primary_key=True, index=True)
+    display_name = Column(String, nullable=False, unique=True, index=True)
+    price_feed_symbol = Column(String, nullable=False)
+    active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class Signal(Base):
+    __tablename__ = "signals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    bot_id = Column(Integer, ForeignKey("bots.id"), nullable=True, index=True)
+    channel_id = Column(Integer, ForeignKey("channels.id"), nullable=True, index=True)
+    source_message_id = Column(Integer, nullable=True, index=True)
+    emiten = Column(String, nullable=True)
+    price_feed_symbol = Column(String, nullable=True, index=True)
+    signal_type = Column(String, nullable=True)          # "BUY" / "SELL"
+    entry_price = Column(Float, nullable=True)
+    stop_loss = Column(Float, nullable=True)
+    exit_price = Column(Float, nullable=True)
+    status = Column(String, default="OPEN", nullable=False, index=True)  # OPEN / TP_HIT / SL_HIT / CLOSED
+    pending_sl_broadcast = Column(Boolean, default=False, index=True)
+    raw_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), index=True)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    targets = relationship("SignalTarget", back_populates="signal", cascade="all, delete-orphan")
+    bot = relationship("Bot")
+    channel = relationship("Channel")
+
+
+class SignalTarget(Base):
+    __tablename__ = "signal_targets"
+
+    id = Column(Integer, primary_key=True, index=True)
+    signal_id = Column(Integer, ForeignKey("signals.id", ondelete="CASCADE"), nullable=False, index=True)
+    label = Column(String, nullable=False)   # e.g. "TP1", "TP2"
+    price = Column(Float, nullable=False)
+    achieved = Column(Boolean, default=False, nullable=False)
+    achieved_at = Column(DateTime, nullable=True)
+    achieved_by = Column(String, nullable=True)  # "AUTO" / "MANUAL"
+
+    signal = relationship("Signal", back_populates="targets")
